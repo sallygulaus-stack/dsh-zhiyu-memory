@@ -1,0 +1,109 @@
+[
+  {
+    "id": "assistant-origin",
+    "turn": {
+      "id": "blind-assistant-1",
+      "sessionId": "blind-assistant",
+      "speaker": "assistant",
+      "text": "我会在明天上线。",
+      "turnIndex": 0,
+      "occurredAt": "2026-11-22T00:00:00.000Z",
+      "recordedAt": "2026-11-22T00:00:00.000Z"
+    },
+    "expected": {
+      "authority": "assistant",
+      "polarity": "affirmed",
+      "modality": "plan",
+      "visibility": "recallable"
+    }
+  },
+  {
+    "id": "user-negation",
+    "turn": {
+      "id": "blind-negation-1",
+      "sessionId": "blind-negation",
+      "speaker": "user",
+      "text": "我不住在上海。",
+      "turnIndex": 0,
+      "occurredAt": "2026-11-22T00:00:00.000Z",
+      "recordedAt": "2026-11-22T00:00:00.000Z"
+    },
+    "expected": {
+      "authority": "user",
+      "polarity": "negated",
+      "modality": "assertion",
+      "visibility": "evidence-only"
+    }
+  },
+  {
+    "id": "user-hypothesis",
+    "turn": {
+      "id": "blind-hypothesis-1",
+      "sessionId": "blind-hypothesis",
+      "speaker": "user",
+      "text": "如果以后一起旅行就好了。",
+      "turnIndex": 0,
+      "occurredAt": "2026-11-22T00:00:00.000Z",
+      "recordedAt": "2026-11-22T00:00:00.000Z"
+    },
+    "expected": {
+      "authority": "user",
+      "polarity": "hypothetical",
+      "modality": "wish",
+      "visibility": "evidence-only"
+    }
+  },
+  {
+    "id": "user-reported",
+    "turn": {
+      "id": "blind-reported-1",
+      "sessionId": "blind-reported",
+      "speaker": "user",
+      "text": "我聽說爸爸明天會搬家。",
+      "turnIndex": 0,
+      "occurredAt": "2026-11-22T00:00:00.000Z",
+      "recordedAt": "2026-11-22T00:00:00.000Z"
+    },
+    "expected": {
+      "authority": "user",
+      "polarity": "reported",
+      "modality": "reported",
+      "visibility": "evidence-only"
+    }
+  },
+  {
+    "id": "user-assertion",
+    "turn": {
+      "id": "blind-assertion-1",
+      "sessionId": "blind-assertion",
+      "speaker": "user",
+      "text": "我喜欢先看结论。",
+      "turnIndex": 0,
+      "occurredAt": "2026-11-22T00:00:00.000Z",
+      "recordedAt": "2026-11-22T00:00:00.000Z"
+    },
+    "expected": {
+      "authority": "user",
+      "polarity": "affirmed",
+      "modality": "assertion",
+      "visibility": "recallable"
+    }
+  },
+  {
+    "id": "purged-claim",
+    "turn": {
+      "id": "blind-purge-1",
+      "sessionId": "blind-purge",
+      "speaker": "user",
+      "text": "我的测试住址是蓝屋。",
+      "turnIndex": 0,
+      "occurredAt": "2026-11-22T00:00:00.000Z",
+      "recordedAt": "2026-11-22T00:00:00.000Z"
+    },
+    "operation": "purge-claim",
+    "expected": {
+      "authority": "user",
+      "purgeClaimAbsent": true
+    }
+  }
+]

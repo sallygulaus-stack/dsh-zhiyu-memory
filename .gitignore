@@ -1,0 +1,17 @@
+# Local records, private integration probes, and the legacy file: package.
+/说明.md
+/*-20*.md
+/plugin/说明.md
+/plugin/package.json
+/plugin/cordis.patch.yml
+/src/mechanism-probes.mjs
+/src/native-candidate-probes.mjs
+
+node_modules/
+.env*
+.dsh/
+.companion-memory/
+companion-memory/
+*.jsonl
+*.log
+*.tgz

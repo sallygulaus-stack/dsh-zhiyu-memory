@@ -1,0 +1,35 @@
+{
+  "name": "dsh-zhiyu-memory",
+  "version": "0.1.1",
+  "private": true,
+  "type": "module",
+  "description": "Evidence-backed companion memory for DeepSeek Harness",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/sallygulaus-stack/dsh-zhiyu-memory.git"
+  },
+  "main": "./plugin/lib/index.js",
+  "exports": {
+    ".": "./plugin/lib/index.js",
+    "./cordis.patch.yml": "./cordis.patch.yml"
+  },
+  "files": [
+    "plugin/lib/index.js",
+    "cordis.patch.yml"
+  ],
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    }
+  },
+  "scripts": {
+    "test": "node --test tests/*.test.mjs",
+    "run:smoke": "node src/cli.mjs smoke",
+    "run:live": "node src/cli.mjs live",
+    "run:migrate-puppet": "node src/migrate-puppet-memory.mjs"
+  },
+  "engines": {
+    "node": ">=22"
+  }
+}

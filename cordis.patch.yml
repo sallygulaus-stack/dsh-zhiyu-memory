@@ -1,0 +1,7 @@
+- insert:
+    - id: companion-memory
+      name: dsh-zhiyu-memory
+      config:
+        maxRecall: 6
+        dailyWriteBudget: 24
+        llmEveryTurns: 8
