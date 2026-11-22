@@ -1,0 +1,36 @@
+{
+  "format": 1,
+  "title": "dsh-zhiyu-memory",
+  "plugins": [
+    {
+      "name": "dsh-zhiyu-memory",
+      "description": {
+        "en": "Evidence-backed companion memory for DeepSeek Harness",
+        "zh": "可回溯对话证据的本地记忆插件"
+      },
+      "repository": {
+        "url": "https://github.com/sallygulaus-stack/dsh-zhiyu-memory"
+      },
+      "versions": [
+        {
+          "version": "0.1.2",
+          "publishTimestamp": 1795361007,
+          "source": {
+            "type": "git",
+            "url": "https://github.com/sallygulaus-stack/dsh-zhiyu-memory",
+            "commit": "3cbe63e8fa9e651db6b4a7eaf5110162296b3fa9"
+          }
+        },
+        {
+          "version": "0.1.1",
+          "publishTimestamp": 1795360704,
+          "source": {
+            "type": "git",
+            "url": "https://github.com/sallygulaus-stack/dsh-zhiyu-memory",
+            "commit": "fdfd5d389ec34739dec2dd03104e8035023b6ce5"
+          }
+        }
+      ]
+    }
+  ]
+}
