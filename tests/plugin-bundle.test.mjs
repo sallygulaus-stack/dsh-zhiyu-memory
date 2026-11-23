@@ -165,6 +165,42 @@ test('DSH bundle 只在具体词组匹配时召回能核实聊天原话的木偶
   }
 })
 
+test('DSH bundle 会召回用户人工确认的旧木偶摘要并保留证据等级说明', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'companion-human-reviewed-'))
+  const memory = {
+    id: 'human-reviewed-legacy',
+    kind: 'event',
+    subcategory: 'milestone',
+    speaker: 'user',
+    sourceKind: 'puppet-memory',
+    sourceFile: 'behavior/notes.jsonl',
+    sourceTurnIds: ['legacy-summary-turn'],
+    sourceSessionId: 'legacy-session',
+    summary: '爸爸曾经给小鱼做过一首专属单曲和 MV。',
+    evidence: '爸爸曾经给小鱼做过一首专属单曲和 MV。',
+    occurredAt: '2026-10-29T11:47:10.503Z',
+    recordedAt: '2026-11-23T04:34:22.847Z',
+    visibility: 'recallable',
+    epistemicStatus: 'accepted',
+    migrationStatus: 'human-reviewed',
+    migrationReason: 'user-manual-review',
+    humanReview: {
+      reviewer: 'user',
+      reviewedAt: '2026-11-23T13:50:00.000Z',
+      machineEvidence: 'legacy-summary-without-verified-span',
+    },
+    status: 'active',
+    importance: 0.8,
+    strength: 0.8,
+  }
+  await writeFile(join(root, 'turns.jsonl'), '')
+  await writeFile(join(root, 'memories.json'), JSON.stringify([memory]))
+  const engine = await new MemoryEngine(root, 6).init()
+  const hits = await engine.recall('你还记得爸爸做过单曲和 MV 吗？', 'fresh-session')
+  assert.deepEqual(hits.map((hit) => hit.memory.id), [memory.id])
+  assert.match(await engine.context('fresh-session', '你还记得爸爸做过单曲和 MV 吗？'), /爸爸人工确认的旧木偶记忆摘要/u)
+})
+
 test('DSH bundle 会用近期对话展开“那个/这种”指代后再自动注入', async () => {
   const root = await mkdtemp(join(tmpdir(), 'companion-auto-reference-'))
   const engine = await new MemoryEngine(root, 6).init()
@@ -188,6 +224,109 @@ test('DSH bundle 会用近期对话展开“那个/这种”指代后再自动�
   assert.equal(recall.query, '今天还是那个搭配。')
   assert.match(recall.retrievalQuery, /四格小菜搭配/u)
   assert.ok(engine.events.findLast((event) => event.type === 'auto-inject').memoryIds.includes(saved.memory.id))
+})
+
+test('DSH bundle 能接上短句，只用最近一件事作线索，不重新翻出同会话更早的话题', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'companion-elided-followup-'))
+  const engine = await new MemoryEngine(root, 6).init()
+  const add = (sessionId, text) => engine.ingest({ sessionId, speaker: 'user', text })
+  const older = await add('parent', '我喜欢吃蓝莓松饼。')
+  const meal = await add('parent', '我喜欢把黄瓜和豆角分成四格菜盘。')
+  await engine.session('child', 'parent')
+  await add('child', '那就原样。')
+  const context = await engine.context('child', '那就原样。')
+  assert.match(context, /四格菜盘/u)
+  assert.doesNotMatch(context, /松饼/u)
+  assert.deepEqual(engine.events.findLast((event) => event.type === 'auto-inject').memoryIds, [meal.memory.id])
+  assert.notEqual(meal.memory.id, older.memory.id)
+})
+
+test('DSH bundle 不用上一会话的话题覆盖本轮明确换过的话题', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'companion-reference-topic-change-'))
+  const engine = await new MemoryEngine(root, 6).init()
+  await engine.ingest({ sessionId: 'parent', speaker: 'user', text: '我喜欢把黄瓜和豆角分成四格菜盘。' })
+  await engine.session('child', 'parent')
+  const current = await engine.ingest({ sessionId: 'child', speaker: 'user', text: '我喜欢先讲结论、再给背景。' })
+  const context = await engine.context('child', '还是那样？')
+  assert.match(context, /结论/u)
+  assert.doesNotMatch(context, /黄瓜|上一会话最近内容/u)
+  assert.deepEqual(engine.events.findLast((event) => event.type === 'auto-inject').memoryIds, [current.memory.id])
+})
+
+test('DSH bundle 独立会话的无锚指代和普通点餐不注入旧菜盘，也不调用语义模型', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'companion-reference-abstain-'))
+  let calls = 0
+  const engine = await new MemoryEngine(root, 6, { llm: { chatJson: async () => {
+    calls++
+    return { value: { memoryIds: [] } }
+  } } }).init()
+  await engine.ingest({ sessionId: 'old', speaker: 'user', text: '我喜欢把黄瓜和豆角分成四格菜盘。' })
+  await engine.session('independent')
+  assert.match(await engine.context('independent', '还是那样？'), /直接、简短地问用户指哪一件/u)
+  assert.equal(engine.events.findLast((event) => event.type === 'auto-inject').injected, false)
+  for (const query of ['今晚吃什么？', '还是算一下 8 乘 7 吧。']) {
+    assert.equal(await engine.context('independent', query), '')
+  }
+  await engine.session('child', 'old')
+  assert.equal(await engine.context('child', '今晚吃什么？'), '')
+  assert.equal(await engine.context('child', '好。'), '')
+  assert.equal(calls, 0)
+  assert.match(await engine.context('child', '继续说刚才那份四格菜盘'), /黄瓜/u)
+})
+
+test('DSH bundle 在问上次吃过什么时区分实际一餐和相近的个人偏好', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'companion-meal-event-'))
+  const engine = await new MemoryEngine(root, 6).init()
+  await engine.ingest({ sessionId: 'other', speaker: 'user', text: '我喜欢把黄瓜和豆角分成四格菜盘。' })
+  const { memory } = await engine.ingest({
+    sessionId: 'parent',
+    speaker: 'user',
+    text: '昨晚吃了黄瓜、豆角和腌萝卜。',
+  })
+  await engine.session('child', 'parent')
+  const context = await engine.context('child', '今晚还是吃上次那套？')
+  assert.match(context, /腌萝卜/u)
+  assert.doesNotMatch(context, /四格菜盘/u)
+  assert.deepEqual(engine.events.findLast((event) => event.type === 'auto-inject').memoryIds, [memory.id])
+  assert.match(await engine.context('unlinked', '今晚还是吃上次那套？'), /直接、简短地问用户指哪一件/u)
+  assert.deepEqual(await engine.recall('上次吃的那套 晚饭 点餐 常点', 'unlinked'), [])
+  assert.match(await engine.context('unlinked', '上回有腌萝卜的那顿饭吃了哪些？'), /腌萝卜/u)
+})
+
+test('DSH bundle 已阻断的条目原话不会由父会话临时窗口重新注入', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'companion-reference-blocked-'))
+  const engine = await new MemoryEngine(root, 6).init()
+  const { memory } = await engine.ingest({ sessionId: 'parent', speaker: 'user', text: '我喜欢把黄瓜和豆角分成四格菜盘。' })
+  await engine.session('child', 'parent')
+  await engine.forget(memory.id, false, 'recall-block')
+  assert.doesNotMatch(await engine.context('child', '那就原样。'), /黄瓜|上一会话最近内容/u)
+  const restarted = await new MemoryEngine(root, 6).init()
+  assert.doesNotMatch(await restarted.context('child', '还是那样？'), /黄瓜|上一会话最近内容/u)
+})
+
+test('DSH bundle 不把多天前的父会话当成刚聊过的话题', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'companion-stale-parent-window-'))
+  const engine = await new MemoryEngine(root, 6).init()
+  const { turn } = await engine.ingest({ sessionId: 'parent', speaker: 'user', text: '我喜欢把黄瓜和豆角分成四格菜盘。' })
+  turn.recordedAt = new Date(Date.now() - 4 * 86400000).toISOString()
+  await engine.session('child', 'parent')
+  assert.match(await engine.context('child', '那就原样。'), /直接、简短地问用户指哪一件/u)
+  assert.match(await engine.context('child', '你还记得我喜欢怎么搭配四格菜盘吗？'), /黄瓜/u)
+})
+
+test('DSH bundle 不把久远情绪作为顺带话题注入，但明确回顾时仍可查', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'companion-faded-emotion-'))
+  const engine = await new MemoryEngine(root, 6).init()
+  const { memory } = await engine.ingest({
+    sessionId: 'old',
+    speaker: 'user',
+    text: '我当时因为蓝湾面试非常紧张。',
+    occurredAt: new Date(Date.now() - 180 * 86400000).toISOString(),
+    forcedKind: 'emotion',
+  })
+  memory.lastSupportedAt = memory.occurredAt
+  assert.equal(await engine.context('fresh', '现在蓝湾面试怎么准备才不紧张？'), '')
+  assert.match(await engine.context('fresh', '记得当时蓝湾面试我紧张吗？'), /蓝湾面试/u)
 })
 
 test('DSH bundle 的明确 remember 可以保存可召回的否定事实，但问题仍隔离', async () => {

@@ -19,10 +19,17 @@ const HALF_LIFE_HOURS = {
 }
 const DEFAULT_DAILY_WRITE_BUDGET = 24
 const DEFAULT_SEMANTIC_THRESHOLD = 0.18
+const PARENT_WINDOW_MAX_AGE_MS = 72 * 3600000
 const LEXICAL_STOP_CHARS = new Set('的了是我你他她它我们你们他们和与在于从到这那个也都一有没不要请记住什么哪吗呢吧会能可以已经还就按把为并且'.split(''))
 const SEMANTIC_HISTORY_QUERY = /(上次|以前|之前|那次|记得|共同|经历|当时|曾经|换个说法|有关)/u
-const IMPLICIT_REFERENCE_QUERY = /(刚才|刚刚|上一(?:轮|个对话|个会话)|上次|接着|继续|前面|之前说的|我们聊到|还没说完|那个|这种|这样|一样|照旧|还是|又来|再来)/u
-const PARENT_WINDOW_QUERY = IMPLICIT_REFERENCE_QUERY
+const CONTINUATION_CUE = /刚才|刚刚|上一(?:轮|个对话|个会话)|前面|之前说的|我们聊到|还没说完|(?:接着|继续)(?:说|聊|吧|下去|就|做)|上(?:回|次)(?:那|的)|那个|那样|那份|那套|这种|这样|一样|照旧|原样|照原来|老样子/u
+const SHORT_CONTINUATION = /^(?:嗯|好|那|就|还|用|按|还是|再来|继续|老规矩|照旧|原样|照原来|老样子|不改了|不换了|那样|这样|那份|那套|那个|刚(?:才|刚)(?:说的)?|也|来吧|行吗|可以吗|吗|吧|呢|[，、,.。！!？?\s])+$/u
+const OPEN_MEAL_QUERY = /^(?:现在|今天(?:晚上)?|今晚|中午|晚上|明天|早上|早餐|午餐|晚餐|夜宵)?[，、,\s]*(?:我们|咱们)?(?:想|要|该|可以|应该)?吃(?:点儿?|些)?什么(?:好|呢|呀|啊|吧|合适)?[。！!？?\s]*$/u
+const MEAL_WORD = /吃|饭|菜|点餐|夜宵/u
+const PAST_MEAL = /(?:吃了|吃过|点了|点过|那顿饭|昨晚的(?:饭|菜)|昨天的(?:饭|菜))/u
+const REVIEWED_HISTORY_QUERY = /上(?:回|次)|以前|之前|曾经|当时|那天|那次|还?记得|说过|发过|送过|聊过|做过|提过/u
+const FOCAL_STOP_WORDS = new Set('还是 希望 想要 喜欢 偏好 习惯 不要 知道 可以 这个 那个 这个事 这样 那样 那份 那套 那顿 那天 一样 原样 照旧 继续 接着 上次 上回 今天 今晚 最近 昨天 刚才 那次 搭配 记住 记得 内容 怎么 什么 当然 然后 我们 以前 之后 当时 晚餐 午餐 早餐 晚饭 吃饭 饭菜 夜宵 吃法'.split(' '))
+const FADED_MEMORY_STRENGTH = 0.08
 const SUBCATEGORY_RULES = Object.freeze({
   fact: [
     ['residence', /(住在|居住|搬到|搬家|地址|城市|来自)/u],
@@ -244,6 +251,27 @@ function puppetWords(text) {
   return new Set([...PUPPET_SEGMENTER.segment(normalize(text))]
     .filter(({ isWordLike, segment }) => isWordLike && [...segment].length >= 2 && /\p{L}/u.test(segment))
     .map(({ segment }) => segment))
+}
+
+function focalWords(text) {
+  return new Set([...puppetQueryAnchors(text)].filter((word) => !FOCAL_STOP_WORDS.has(word)))
+}
+
+function overlapCount(left, right) {
+  let count = 0
+  for (const word of left) if (right.has(word)) count++
+  return count
+}
+
+function shortContinuation(text) {
+  return text.length <= 32 && (CONTINUATION_CUE.test(text) || /再来|继续|老规矩|不改了|不换了/u.test(text))
+    && SHORT_CONTINUATION.test(text)
+}
+
+function pastMealQuery(text) {
+  return MEAL_WORD.test(text) && /上(?:次|回)|那顿|以前|之前|当时|那天|昨(?:天|晚)/u.test(text)
+    && (PAST_MEAL.test(text) || (!/喜欢|偏好|习惯/u.test(text)
+      && /(?:吃|点)上(?:次|回)|(?:上(?:次|回)|那天|当时).{0,8}(?:吃|点了)|那顿/u.test(text)))
 }
 
 function queryTopic(text) {
@@ -845,30 +873,48 @@ class MemoryEngine {
     return memory
   }
 
-  async retrieve(query, sessionId = null, { logQuery = null, mode = 'tool' } = {}) {
+  async retrieve(query, sessionId = null, { logQuery = null, mode = 'tool', reference = null, skip = false } = {}) {
     const started = Date.now()
     const value = stripRetrievalWrapper(query)
-    const commitmentIntent = /(承诺|答应|要求.*记住|别忘|未完成|还没完成)/u.test(value)
-    const relationshipIntent = /(我们|共同|关系|那次|上次发生|修复)/u.test(value)
-    const topic = queryTopic(value) || (commitmentIntent ? 'commitment' : relationshipIntent ? 'relationship' : null)
+    const direct = stripRetrievalWrapper(logQuery ?? query)
+    const commitmentIntent = /(承诺|答应|要求.*记住|别忘|未完成|还没完成)/u.test(direct)
+    const relationshipIntent = /(我们|共同|关系|那次|上次发生|修复)/u.test(direct)
+    const historic = SEMANTIC_HISTORY_QUERY.test(direct) || /上回/u.test(direct)
+    const mealHistory = pastMealQuery(direct)
+    const topic = queryTopic(direct) || (commitmentIntent ? 'commitment' : relationshipIntent ? 'relationship' : null)
     const at = now()
     const legacyTurns = new Map(this.turns
       .filter((turn) => turn.sourceKind === 'puppet-memory' && !this.purgedTurnIds.has(turn.id))
       .map((turn) => [turn.id, turn]))
-    const legacyAnchors = puppetQueryAnchors(value)
-    const candidates = [...this.memories.values()]
+    const legacyAnchors = reference?.words ?? puppetQueryAnchors(direct)
+    const directWords = focalWords(direct)
+    const candidates = (skip ? [] : [...this.memories.values()])
       .flatMap((row) => {
         const legacy = anchoredPuppetSource(row, legacyTurns)
         if (!candidateIsRecallable(row, legacy)) return []
-        const lexical = lexicalScore(value, `${row.summary} ${row.evidence} ${row.factKey}`)
+        const text = `${row.summary} ${row.evidence}`
+        const lexical = lexicalScore(direct, `${text} ${row.factKey}`)
+        if (reference && !overlapCount(reference.words, focalWords(text))) return []
+        if (mealHistory && (!['event', 'relationship'].includes(row.kind) || !PAST_MEAL.test(row.evidence || '')
+          || (row.polarity && row.polarity !== 'affirmed')
+          || (!reference && !overlapCount(directWords, focalWords(text))))) return []
+        const reviewedHistory = row.sourceKind === 'puppet-qq-reviewed'
+        if (reviewedHistory) {
+          const anchors = overlapCount(directWords, focalWords(text))
+          if (!REVIEWED_HISTORY_QUERY.test(direct) || !(anchors >= 2 || (anchors === 1 && lexical >= 0.38))) return []
+        }
         const recent = freshness(row, at)
+        const effectiveStrength = strength(row, at)
+        if (mode === 'auto' && row.kind === 'emotion' && effectiveStrength < FADED_MEMORY_STRENGTH
+          && !(historic && overlapCount(directWords, focalWords(text)))) return []
         const intent = commitmentIntent && row.kind === 'commitment' ? (row.speaker === 'user' ? 0.55 : 0.18) : relationshipIntent && row.kind === 'relationship' ? 0.4 : 0
         const sameSession = sessionId && row.sourceSessionId === sessionId ? 0.08 : 0
         const priorityBoost = row.writePriority === 'priority' ? 0.12 : 0
         const topicMatch = topicMatches(row, topic)
         const topicBoost = topic && topicMatch ? 0.3 : 0
         const topicPenalty = topic && !topicMatch && lexical < 0.4 ? 0.35 : 0
-        const score = lexical * 0.52 + recent * 0.1 + strength(row, at) * 0.12 + row.importance * 0.08
+        const focusScore = reference ? lexicalScore(reference.focus.text, text) : 0
+        const score = Math.max(lexical, focusScore) * 0.52 + recent * 0.1 + effectiveStrength * 0.12 + row.importance * 0.08
           + intent + sameSession + priorityBoost + topicBoost - topicPenalty
         if (legacy) {
           const sourceTerms = puppetWords(row.evidence)
@@ -876,11 +922,11 @@ class MemoryEngine {
           if (!anchors) return []
           return [{ memory: row, score: anchors / legacyAnchors.size * 0.72 + lexical * 0.18 + recent * 0.05, lexical, semantic: false, topicMatch, legacy }]
         }
-        return [{ memory: row, score, lexical, semantic: false, topicMatch }]
+        return [{ memory: row, score, lexical, focusScore, semantic: false, topicMatch, reviewedHistory }]
       })
     const lexicalMax = candidates.reduce((max, item) => Math.max(max, item.lexical), 0)
     let semanticUsed = false
-    if (this.llm && SEMANTIC_HISTORY_QUERY.test(value) && lexicalMax < this.semanticThreshold) {
+    if (!skip && this.llm && historic && !reference && lexicalMax < this.semanticThreshold) {
       const semantic = await this.semanticRetrieve(value, candidates, sessionId)
       semanticUsed = semantic.used
       for (const item of semantic.items) {
@@ -892,14 +938,17 @@ class MemoryEngine {
       }
     }
     const hits = candidates
-      .filter((item) => item.legacy || (topic
-        ? (item.topicMatch || item.lexical >= 0.6 || item.semantic)
-        : (item.lexical >= 0.2
+      .filter((item) => {
+        if (item.legacy || item.semantic || item.reviewedHistory) return true
+        if (reference) return item.focusScore >= 0.2
+        if (mealHistory) return true
+        if (topic) return item.topicMatch || item.lexical >= 0.6
+        return item.lexical >= 0.2
           || (commitmentIntent && item.memory.kind === 'commitment')
           || (relationshipIntent && item.memory.kind === 'relationship')
-          || item.semantic)))
+      })
       .sort((a, b) => b.score - a.score)
-      .slice(0, this.maxRecall)
+      .slice(0, reference || mealHistory ? Math.min(1, this.maxRecall) : this.maxRecall)
     this.events.push({
       at,
       type: 'recall',
@@ -1010,25 +1059,38 @@ class MemoryEngine {
 
   async context(sessionId, query) {
     const originalQuery = String(query ?? '').trim()
-    const retrievalQuery = this.contextQuery(sessionId, originalQuery)
+    const direct = stripRetrievalWrapper(originalQuery)
+    const reference = this.contextReference(sessionId, direct)
+    const retrievalQuery = reference
+      ? [direct, ...reference.turns.map((turn) => `${turn.speaker === 'user' ? '用户' : '助手'}：${turn.text}`)]
+        .join('\n').slice(0, 1800)
+      : direct
     const hits = await this.retrieve(retrievalQuery, sessionId, {
       logQuery: originalQuery,
       mode: 'auto',
+      reference,
+      skip: OPEN_MEAL_QUERY.test(direct) || (shortContinuation(direct) && !reference),
     })
-    const session = this.sessions.get(sessionId)
-    const parentContext = this.parentWindowContext(session, originalQuery)
+    const parentContext = this.parentWindowContext(reference)
+    const unclearReference = !reference && !hits.length && !OPEN_MEAL_QUERY.test(direct)
+      && (shortContinuation(direct) || pastMealQuery(direct))
     const lines = []
     if (parentContext) lines.push(parentContext)
     if (hits.length) {
       lines.push(
         '【伴生记忆回忆】',
         '以下是自动检索到的有来源参考；普通连续性不需要再次调用记忆工具。只有需要完整原话、确认、纠正或删除时才调用工具。',
-        hits.map(({ memory, semantic, legacy }) => {
+        hits.map(({ memory, semantic, legacy, reviewedHistory }) => {
           const evidence = String(memory.evidence || memory.summary || '').replace(/\s+/gu, ' ').slice(0, 160)
           const occurred = memory.occurredAt ? String(memory.occurredAt).slice(0, 10) : '未知'
           const match = semantic ? '语义关联' : '词面关联'
-          const provenance = legacy ? '迁移对话用户原话（历史陈述，不等于当前事实）' : '证据'
-          return `- ${memory.kind}/${memory.status}：${memory.summary}（${provenance}：“${evidence}”；发生于 ${occurred}；来源：${legacy || memory.sourceTurnIds.join(',')}；${match}）`
+          const provenance = legacy ? '迁移对话用户原话（历史陈述，不等于当前事实）'
+            : reviewedHistory ? `旧私聊${memory.speaker === 'assistant' ? '助手' : '用户'}原话（仅证明当时说过）`
+              : memory.humanReview?.reviewer === 'user'
+                ? '爸爸人工确认的旧木偶记忆摘要（历史陈述；未保留逐字原话）'
+                : '证据'
+          const timeLabel = memory.historicalTimeBasis === 'snapshot-captured-at' ? '收录日期（UTC）' : '发生于'
+          return `- ${memory.kind}/${memory.status}：${memory.summary}（${provenance}：“${evidence}”；${timeLabel} ${occurred}；来源：${legacy || memory.sourceTurnIds.join(',')}；${match}）`
         }).join('\n'),
       )
     }
@@ -1043,50 +1105,60 @@ class MemoryEngine {
       memoryIds: hits.map(({ memory }) => memory.id),
       hitCount: hits.length,
       parentWindow: Boolean(parentContext),
+      unclearReference,
       injected: Boolean(context),
       injectedChars: context.length,
       semanticUsed: Boolean(recallEvent?.type === 'recall' && recallEvent.semanticUsed),
     }
     this.events.push(autoEvent)
     await this.append('events.jsonl', autoEvent)
+    if (unclearReference) {
+      return '【本轮接话】这句指代没有匹配的对话线索或记忆。下一条直接、简短地问用户指哪一件；不调用工具，不访问文件，不猜测。'
+    }
     return context
   }
 
-  contextQuery(sessionId, query) {
-    const value = String(query || '').trim()
-    if (!value || !IMPLICIT_REFERENCE_QUERY.test(value)) return value
+  contextReference(sessionId, query) {
+    if (!CONTINUATION_CUE.test(query) && !shortContinuation(query)) return null
     const session = this.sessions.get(sessionId)
-    const parentId = session?.parentSessionId
-    const currentTurns = this.turns
-      .filter((turn) => turn.sessionId === sessionId && !this.purgedTurnIds.has(turn.id))
-      .slice(-4)
-    const parentTurns = parentId
-      ? this.turns
-        .filter((turn) => turn.sessionId === parentId && !this.purgedTurnIds.has(turn.id))
+    const queryWords = focalWords(query)
+    const topic = queryTopic(query)
+    const parentCutoff = Date.now() - PARENT_WINDOW_MAX_AGE_MS
+    for (const id of [sessionId, session?.parentSessionId].filter(Boolean)) {
+      const nearby = this.turns
+        .filter((turn) => turn.sessionId === id && ['user', 'assistant'].includes(turn.speaker)
+          && !this.purgedTurnIds.has(turn.id))
         .slice(-4)
-      : []
-    const nearby = [...parentTurns, ...currentTurns]
-      .map((turn) => `${turn.speaker === 'user' ? '用户' : turn.speaker === 'assistant' ? '助手' : '记录'}：${turn.text}`)
-      .filter(Boolean)
-    if (!nearby.length) return value
-    return [value, ...nearby].join('\n').slice(0, 1800)
+      const latest = nearby.at(-1)
+      if (id === sessionId && latest?.speaker === 'user' && stripRetrievalWrapper(latest.text) === query) nearby.pop()
+      const index = nearby.findLastIndex((turn) => turn.speaker === 'user'
+        && !LOW_VALUE.test(turn.text) && !shortContinuation(turn.text) && focalWords(turn.text).size > 0)
+      if (index < 0) continue
+      const focus = nearby[index]
+      if (id !== sessionId && !(Date.parse(focus.recordedAt) >= parentCutoff)) return null
+      const words = focalWords(focus.text)
+      if (topic ? queryTopic(focus.text) !== topic && !overlapCount(queryWords, words)
+        : queryWords.size && !shortContinuation(query) && !overlapCount(queryWords, words)) return null
+      const answer = nearby[index + 1]
+      const turns = answer?.speaker === 'assistant' ? [focus, answer] : [focus]
+      const ids = new Set(turns.map((turn) => turn.id))
+      if ([...this.memories.values()].some((memory) => (
+        memory.visibility === 'hidden' || ['deleted', 'hidden'].includes(memory.status)
+          || ['soft-deleted', 'recall-blocked', 'purged'].includes(memory.deletionState)
+      ) && memory.sourceTurnIds?.some((turnId) => ids.has(turnId)))) return null
+      return { focus, words, turns, fromParent: id !== sessionId }
+    }
+    return null
   }
 
-  parentWindowContext(session, query) {
-    const parentId = session?.parentSessionId
-    if (!parentId) return ''
-    const currentTurns = this.turns.filter((turn) => turn.sessionId === session.id)
-    if (currentTurns.length > 1 && !PARENT_WINDOW_QUERY.test(String(query || ''))) return ''
-    const parentTurns = this.turns
-      .filter((turn) => turn.sessionId === parentId && !this.purgedTurnIds.has(turn.id))
-      .slice(-4)
-    if (!parentTurns.length) return ''
-    const text = parentTurns
+  parentWindowContext(reference) {
+    if (!reference?.fromParent) return ''
+    const text = reference.turns
       .map((turn) => `${turn.speaker === 'user' ? '用户' : turn.speaker === 'assistant' ? '助手' : '记录'}：${turn.text}`)
       .join(' / ')
     return [
       '【上一会话最近内容】',
-      '以下只是上一会话的临时接话线索，不等于长期事实；需要时再用记忆工具核对。',
+      '以下只是上一会话的临时接话线索。建议不等于已经发生；指代不明确时请简短确认。',
       text,
     ].join('\n').slice(0, 1200)
   }
@@ -1096,7 +1168,7 @@ class MemoryEngine {
     for (const memory of this.memories.values()) {
       memory.freshness = freshness(memory, at)
       memory.effectiveStrength = strength(memory, at)
-      if (memory.status === 'active' && memory.effectiveStrength < 0.08) memory.status = 'faded'
+      if (memory.status === 'active' && memory.effectiveStrength < FADED_MEMORY_STRENGTH) memory.status = 'faded'
       if (memory.kind === 'commitment' && memory.status === 'open' && memory.dueAt && new Date(memory.dueAt) <= new Date(at)) memory.status = 'expired'
       await this.saveMemory(memory, 'consolidate')
     }
@@ -1523,7 +1595,7 @@ async function apply(ctx, config = {}) {
   ctx.systemPrompt.section({
     name: 'companion-memory-guidance',
     order: (ctx.systemPrompt.getSectionOrder('TOOLS_SDK') ?? 5000) + 10,
-    text: '伴生记忆已启用。插件会在每轮自动检索并注入相关记忆；普通连续性不需要重复调用 recall。只把自动注入或记忆工具返回的内容当作有来源参考；需要完整原话、确认、纠正或删除时再使用记忆工具。如果用户问以前是否提过某事，而没有相符的记忆或原话，请直接说目前无法确认，不要把推测当成回忆。用户明确纠正、删除或要求忘记时，以最新要求为准。不要因为一次临时情绪或寒暄就扩大长期记忆。',
+    text: '伴生记忆已启用。插件会在每轮自动检索并注入相关记忆；普通连续性不需要重复调用 recall。只把自动注入或记忆工具返回的内容当作有来源参考；需要完整原话、确认、纠正或删除时再使用记忆工具。如果用户问以前是否提过某事，而没有相符的记忆或原话，请直接说目前无法确认，不要把推测当成回忆。遇到「还是那样」「上次那套」等指代，能从当前对话或相关记忆接上就自然接话；如果缺少具体线索且没有匹配的注入，先简短问用户指哪一件，不调用 recall 来盲找，不把相近偏好当成发生过的事。用户明确纠正、删除或要求忘记时，以最新要求为准。不要因为一次临时情绪或寒暄就扩大长期记忆。',
   })
   ctx.systemPrompt.context({
     name: 'companion-memory-recall',
