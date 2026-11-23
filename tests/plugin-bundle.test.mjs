@@ -114,7 +114,7 @@ test('DSH bundle 自动注入会带证据和发生时间，不依赖模型主动
 test('DSH bundle 只在具体词组匹配时召回能核实聊天原话的木偶迁移条目', async () => {
   const root = await mkdtemp(join(tmpdir(), 'companion-puppet-recall-'))
   const sourceFile = 'behavior/diary/2026-11.jsonl'
-  const text = '我喜欢把晚餐分成四格菜盘。'
+  const text = '今天的晚餐我喜欢分成四格菜盘。'
   const at = new Date().toISOString()
   const turn = {
     id: 'original',
@@ -365,6 +365,23 @@ test('DSH bundle 使用 DeepSeek 价格表记录人民币估算费用', async ()
   const stats = await engine.stats()
   assert.equal(stats.usage.estimatedCostCny, 1.82)
   assert.equal(stats.llm.estimatedCostCny, 1.82)
+})
+
+test('DSH bundle 进程重启后不会重复统计同一条模型回复', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'companion-plugin-usage-'))
+  let engine = await new MemoryEngine(root, 6).init()
+  const usage = { prompt_tokens: 120, prompt_cache_hit_tokens: 100, completion_tokens: 10, total_tokens: 130 }
+  const key = 'assistant:fixture:1'
+  await engine.recordUsage(usage, key)
+  await engine.recordUsage(usage, key)
+  engine = await new MemoryEngine(root, 6).init()
+  await engine.recordUsage(usage, key)
+  const { usage: totals, llm } = await engine.stats()
+  assert.equal(totals.modelCalls, 1)
+  assert.equal(totals.totalTokens, 130)
+  assert.equal(totals.cacheReadTokens, 100)
+  assert.equal(totals.estimatedCostCny, 0.000062)
+  assert.equal(llm.calls, 0)
 })
 
 test('DSH bundle 不让普通 LLM 候选覆盖明确记住的优先记忆', async () => {

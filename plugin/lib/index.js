@@ -232,10 +232,18 @@ function lexicalScore(query, text) {
 
 function puppetQueryAnchors(query) {
   const focused = normalize(query).replace(
-    /你还记得|你记得|还记得|记不记得|接着|继续|之前|以前|上次|那次|关于|事情|什么|怎样|怎么|哪些|我们|爸爸|聊吧|(?<=[\p{Script=Han}])(?:吗|呢|吧)(?=[\p{P}\s]|$)/gu,
+    /你还记得|你记得|还记得|记不记得|接着|继续|之前|以前|上次|那次|关于|事情|怎么样|什么|怎样|怎么|哪些|我们|爸爸|今天|刚才|聊吧|(?<=[\p{Script=Han}])(?:吗|呢|吧)(?=[\p{P}\s]|$)/gu,
     ' ',
   )
-  return [...terms(focused)].filter((token) => [...token].length >= 2)
+  return puppetWords(focused)
+}
+
+const PUPPET_SEGMENTER = new Intl.Segmenter('zh-Hans', { granularity: 'word' })
+
+function puppetWords(text) {
+  return new Set([...PUPPET_SEGMENTER.segment(normalize(text))]
+    .filter(({ isWordLike, segment }) => isWordLike && [...segment].length >= 2 && /\p{L}/u.test(segment))
+    .map(({ segment }) => segment))
 }
 
 function queryTopic(text) {
@@ -450,6 +458,7 @@ class MemoryEngine {
     this.memories = new Map()
     this.events = []
     this.seenSources = new Set()
+    this.seenUsageSources = new Set()
     this.consolidationCursors = {}
     this.purgedTurnIds = new Set()
     this.metricsRows = []
@@ -500,18 +509,22 @@ class MemoryEngine {
     this.metricsRows = await this.readJsonl('metrics.jsonl')
     for (const row of this.metricsRows) {
       if (row.kind !== 'model-call') continue
+      if (row.sourceKey) this.seenUsageSources.add(row.sourceKey)
       this.usage.modelCalls += 1
       this.usage.inputTokens += Number(row.inputTokens || 0)
       this.usage.outputTokens += Number(row.outputTokens || 0)
       this.usage.cacheReadTokens += Number(row.cacheReadTokens || 0)
       this.usage.cacheWriteTokens += Number(row.cacheWriteTokens || 0)
       this.usage.totalTokens += Number(row.totalTokens || 0)
-      this.llmStats.calls += 1
-      this.llmStats.jsonErrors += Number(row.jsonErrors || 0)
-      this.llmStats.evidenceRejected += Number(row.evidenceRejected || 0)
-      this.llmStats.estimatedCostUsd += Number(row.estimatedCostUsd || 0)
-      this.llmStats.estimatedCostCny += Number(row.estimatedCostCny || 0)
+      this.usage.estimatedCostUsd += Number(row.estimatedCostUsd || 0)
       this.usage.estimatedCostCny += Number(row.estimatedCostCny || 0)
+      if (row.purpose) {
+        this.llmStats.calls += 1
+        this.llmStats.jsonErrors += Number(row.jsonErrors || 0)
+        this.llmStats.evidenceRejected += Number(row.evidenceRejected || 0)
+        this.llmStats.estimatedCostUsd += Number(row.estimatedCostUsd || 0)
+        this.llmStats.estimatedCostCny += Number(row.estimatedCostCny || 0)
+      }
     }
     return this
   }
@@ -531,17 +544,18 @@ class MemoryEngine {
     await appendFile(join(this.root, file), `${JSON.stringify(value)}\n`, 'utf8')
   }
 
-  async recordUsage(usage) {
-    if (!usage || typeof usage !== 'object') return
+  async recordUsage(usage, sourceKey) {
+    if (!usage || typeof usage !== 'object' || (sourceKey && this.seenUsageSources.has(sourceKey))) return
     const row = {
       at: now(),
       kind: 'model-call',
       inputTokens: Number(usage.inputTokens ?? usage.prompt_tokens ?? usage.promptTokens ?? 0),
       outputTokens: Number(usage.outputTokens ?? usage.completion_tokens ?? usage.completionTokens ?? 0),
-      cacheReadTokens: Number(usage.cacheReadTokens ?? 0),
+      cacheReadTokens: Number(usage.cacheReadTokens ?? usage.prompt_cache_hit_tokens ?? 0),
       cacheWriteTokens: Number(usage.cacheWriteTokens ?? 0),
       totalTokens: Number(usage.totalTokens ?? usage.total_tokens ?? 0),
       model: usage.model ?? this.pricingModel,
+      sourceKey,
     }
     row.estimatedCostUsd = this.estimateCost(row)
     row.estimatedCostCny = this.estimateDeepSeekCost(row).totalCny
@@ -554,6 +568,7 @@ class MemoryEngine {
     this.usage.totalTokens += row.totalTokens
     this.usage.estimatedCostUsd += row.estimatedCostUsd
     this.usage.estimatedCostCny += row.estimatedCostCny
+    if (sourceKey) this.seenUsageSources.add(sourceKey)
     await this.append('metrics.jsonl', row)
   }
 
@@ -856,10 +871,10 @@ class MemoryEngine {
         const score = lexical * 0.52 + recent * 0.1 + strength(row, at) * 0.12 + row.importance * 0.08
           + intent + sameSession + priorityBoost + topicBoost - topicPenalty
         if (legacy) {
-          const sourceTerms = terms(row.evidence)
-          const anchors = legacyAnchors.filter((token) => sourceTerms.has(token)).length
+          const sourceTerms = puppetWords(row.evidence)
+          const anchors = [...legacyAnchors].filter((token) => sourceTerms.has(token)).length
           if (!anchors) return []
-          return [{ memory: row, score: anchors / legacyAnchors.length * 0.72 + lexical * 0.18 + recent * 0.05, lexical, semantic: false, topicMatch, legacy }]
+          return [{ memory: row, score: anchors / legacyAnchors.size * 0.72 + lexical * 0.18 + recent * 0.05, lexical, semantic: false, topicMatch, legacy }]
         }
         return [{ memory: row, score, lexical, semantic: false, topicMatch }]
       })
@@ -927,6 +942,7 @@ class MemoryEngine {
         totalTokens: response.usage?.totalTokens ?? response.usage?.total_tokens ?? 0,
         inputTokens: response.usage?.inputTokens ?? response.usage?.prompt_tokens ?? 0,
         outputTokens: response.usage?.outputTokens ?? response.usage?.completion_tokens ?? 0,
+        cacheReadTokens: response.usage?.cacheReadTokens ?? response.usage?.prompt_cache_hit_tokens ?? 0,
         estimatedCostUsd: this.estimateCost(response.usage),
         jsonErrors: response.retried ? 1 : 0,
         evidenceRejected: 0,
@@ -1236,6 +1252,7 @@ class MemoryEngine {
       totalTokens: response.usage?.totalTokens ?? response.usage?.total_tokens ?? 0,
       inputTokens: response.usage?.inputTokens ?? response.usage?.prompt_tokens ?? 0,
       outputTokens: response.usage?.outputTokens ?? response.usage?.completion_tokens ?? 0,
+      cacheReadTokens: response.usage?.cacheReadTokens ?? response.usage?.prompt_cache_hit_tokens ?? 0,
       estimatedCostUsd: this.estimateCost(response.usage),
       jsonErrors: response.retried ? 1 : 0,
       evidenceRejected: rejected,
@@ -1506,7 +1523,7 @@ async function apply(ctx, config = {}) {
   ctx.systemPrompt.section({
     name: 'companion-memory-guidance',
     order: (ctx.systemPrompt.getSectionOrder('TOOLS_SDK') ?? 5000) + 10,
-    text: '伴生记忆已启用。插件会在每轮自动检索并注入相关记忆；普通连续性不需要重复调用 recall。只把自动注入或记忆工具返回的内容当作有来源参考；需要完整原话、确认、纠正或删除时再使用记忆工具。用户明确纠正、删除或要求忘记时，以最新要求为准。不要因为一次临时情绪或寒暄就扩大长期记忆。',
+    text: '伴生记忆已启用。插件会在每轮自动检索并注入相关记忆；普通连续性不需要重复调用 recall。只把自动注入或记忆工具返回的内容当作有来源参考；需要完整原话、确认、纠正或删除时再使用记忆工具。如果用户问以前是否提过某事，而没有相符的记忆或原话，请直接说目前无法确认，不要把推测当成回忆。用户明确纠正、删除或要求忘记时，以最新要求为准。不要因为一次临时情绪或寒暄就扩大长期记忆。',
   })
   ctx.systemPrompt.context({
     name: 'companion-memory-recall',
@@ -1616,14 +1633,15 @@ async function apply(ctx, config = {}) {
     for (const event of session.snapshotEvents()) {
       if (event.seq <= lastSeq || event.type !== 'assistant/message') continue
       const text = messageText(event.data?.message || event.data)
-      if (text) await engine.ingest({
+      const sourceKey = `assistant:${sessionId}:${event.seq}`
+      const saved = text ? await engine.ingest({
         sessionId,
         parentSessionId: session.header?.parentSession || null,
         speaker: 'assistant',
         text,
-        sourceKey: `assistant:${sessionId}:${event.seq}`,
-      })
-      await engine.recordUsage(event.data?.usage)
+        sourceKey,
+      }) : null
+      if (!text || saved?.stored) await engine.recordUsage(event.data?.usage, sourceKey)
     }
     assistantSeq.set(sessionId, session.seq)
     await engine.consolidate()
