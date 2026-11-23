@@ -5,8 +5,8 @@
     {
       "name": "dsh-zhiyu-memory",
       "description": {
-        "en": "Evidence-backed companion memory for DeepSeek Harness",
-        "zh": "可回溯对话证据的本地记忆插件"
+        "en": "Long-term memory for DeepSeek Harness. Every entry traces back to the sentence it came from, fades by type, and can be corrected or deleted in stages.",
+        "zh": "记得住，也记得清是哪一句"
       },
       "repository": {
         "url": "https://github.com/sallygulaus-stack/dsh-zhiyu-memory"

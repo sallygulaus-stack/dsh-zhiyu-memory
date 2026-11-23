@@ -3,7 +3,7 @@
   "version": "0.1.3",
   "private": true,
   "type": "module",
-  "description": "Evidence-backed companion memory for DeepSeek Harness",
+  "description": "给 DeepSeek Harness 的长期记忆：每条都追得回原话，按类型自然淡化，可纠正、可分级删除。",
   "license": "MIT",
   "repository": {
     "type": "git",
