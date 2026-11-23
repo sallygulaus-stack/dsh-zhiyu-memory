@@ -136,12 +136,19 @@ function evidenceRef(turn, quote) {
 function candidateIsRecallable(memory) {
   // `recall-block` 只把 visibility 改成 'hidden'，原来这里只比对 'evidence-only'，
   // 于是「已阻断召回」的记忆照样被检索出来。deletionState 与 visibility 任一处标记都算阻断。
-  return memory?.visibility !== 'evidence-only'
+  // 木偶迁移条目虽然沿用 evidence-only 标记，但它们自带真实迁移来源回合；
+  // 允许这类有证据的历史条目进入候选，不能把无来源的模型候选一并放行。
+  const migratedWithEvidence = memory?.sourceKind === 'puppet-memory'
+    && Array.isArray(memory?.sourceTurnIds)
+    && memory.sourceTurnIds.length > 0
+    && String(memory?.evidence || '').trim().length > 0
+  return (memory?.visibility !== 'evidence-only' || migratedWithEvidence)
     && memory?.visibility !== 'hidden'
     && !['deleted', 'superseded', 'hidden', 'review'].includes(memory?.status)
     && memory?.deletionState !== 'purged'
     && memory?.deletionState !== 'recall-blocked'
-    && ['accepted', 'supported', undefined, null].includes(memory?.epistemicStatus)
+    && (['accepted', 'supported', undefined, null].includes(memory?.epistemicStatus)
+      || (migratedWithEvidence && memory?.epistemicStatus === 'candidate'))
 }
 
 function localEndOfDay(iso, timeZone = 'UTC', dayOffset = 0) {

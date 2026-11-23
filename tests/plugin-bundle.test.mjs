@@ -111,6 +111,64 @@ test('DSH bundle 自动注入会带证据和发生时间，不依赖模型主动
   assert.equal((await engine.stats()).autoInjectHitCount, 1)
 })
 
+test('DSH bundle 允许有来源回合的木偶迁移记忆参与召回，但仍隔离无来源 evidence-only 候选', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'companion-puppet-recall-'))
+  const engine = await new MemoryEngine(root, 6).init()
+  const turn = await engine.ingest({
+    sessionId: 'puppet-import-test',
+    speaker: 'external',
+    text: '爸爸喜欢把晚餐分成四格菜盘。',
+    sourceKey: 'puppet:test:1',
+  })
+  const source = await engine.remember({
+    id: 'memory_puppet_test',
+    kind: 'preference',
+    subcategory: 'taste',
+    recordType: 'entity',
+    subjectType: 'person',
+    subject: 'user',
+    speaker: 'user',
+    summary: turn.turn.text,
+    evidence: turn.turn.text,
+    sourceTurnIds: [turn.turn.id],
+    sourceSessionId: 'puppet-import-test',
+    sourceKind: 'puppet-memory',
+    visibility: 'evidence-only',
+    status: 'active',
+    epistemicStatus: 'candidate',
+    factKey: 'preference:taste',
+    claimKey: 'preference:taste',
+    importance: 0.8,
+    strength: 0.8,
+    source: turn.turn.id,
+  })
+  const blocked = await engine.remember({
+    id: 'memory_model_candidate',
+    kind: 'preference',
+    subcategory: 'taste',
+    recordType: 'entity',
+    subjectType: 'person',
+    subject: 'user',
+    speaker: 'user',
+    summary: '我可能喜欢别的搭配。',
+    evidence: '我可能喜欢别的搭配。',
+    sourceTurnIds: [],
+    sourceSessionId: 'model-candidate',
+    sourceKind: 'consolidation',
+    visibility: 'evidence-only',
+    status: 'active',
+    epistemicStatus: 'candidate',
+    factKey: 'preference:other',
+    claimKey: 'preference:other',
+    importance: 0.8,
+    strength: 0.8,
+    source: 'none',
+  })
+  const hits = await engine.recall('你记得我喜欢怎么搭配晚餐吗？', 'fresh-session')
+  assert.equal(hits[0].memory.id, source.id)
+  assert.equal(hits.some((hit) => hit.memory.id === blocked.id), false)
+})
+
 test('DSH bundle 会用近期对话展开“那个/这种”指代后再自动注入', async () => {
   const root = await mkdtemp(join(tmpdir(), 'companion-auto-reference-'))
   const engine = await new MemoryEngine(root, 6).init()
