@@ -57,6 +57,7 @@ test('记忆观察面板注册网页和只读数据路由', async () => {
   assert.match(pageResponse.body, /小鱼记忆观察/u)
   assert.match(pageResponse.body, /来源与状态/u)
   assert.match(pageResponse.body, /自动注入命中/u)
+  assert.match(pageResponse.body, /分类概览|事实|偏好/u)
 
   const dataResponse = responseRecorder()
   await routes.get('/companion-memory/console/data').handler({ method: 'GET', url: '/' }, dataResponse)
@@ -64,7 +65,10 @@ test('记忆观察面板注册网页和只读数据路由', async () => {
   const data = JSON.parse(dataResponse.body)
   assert.equal(data.memories.length, 1)
   assert.equal(data.memories[0].evidence, '我喜欢先看结论。')
+  assert.equal(data.memories[0].subcategory, 'response-format')
   assert.equal(data.memories[0].occurredAt, '2026-11-22T10:00:00.000Z')
+  assert.equal(data.stats.categoryCounts.preference, 1)
+  assert.equal(data.stats.subcategoryCounts['preference:response-format'], 1)
   assert.equal(data.stats.autoInjectHitCount, 0)
   assert.ok(data.stats.storageBytes >= 0)
   dispose()

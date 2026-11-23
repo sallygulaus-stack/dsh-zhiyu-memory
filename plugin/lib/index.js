@@ -3,6 +3,7 @@ import { dirname, isAbsolute, join, resolve } from 'node:path'
 import { homedir } from 'node:os'
 import { createHash, randomUUID } from 'node:crypto'
 import { registerMemoryConsoleRoutes } from './console.js'
+import { calculateDeepSeekCost } from './pricing.js'
 
 const name = 'companion-memory'
 const inject = ['tools', 'systemPrompt', 'llm']
@@ -22,6 +23,53 @@ const LEXICAL_STOP_CHARS = new Set('的了是我你他她它我们你们他们�
 const SEMANTIC_HISTORY_QUERY = /(上次|以前|之前|那次|记得|共同|经历|当时|曾经|换个说法|有关)/u
 const IMPLICIT_REFERENCE_QUERY = /(刚才|刚刚|上一(?:轮|个对话|个会话)|上次|接着|继续|前面|之前说的|我们聊到|还没说完|那个|这种|这样|一样|照旧|还是|又来|再来)/u
 const PARENT_WINDOW_QUERY = IMPLICIT_REFERENCE_QUERY
+const SUBCATEGORY_RULES = Object.freeze({
+  fact: [
+    ['residence', /(住在|居住|搬到|搬家|地址|城市|来自)/u],
+    ['identity', /(我叫|我的名字|我是|身份|生日)/u],
+    ['work', /(工作|公司|职业|上班|学习|学校|专业)/u],
+    ['health', /(身体|生病|健康|过敏|吃药|看医生)/u],
+    ['schedule', /(今天|昨天|明天|最近|正在|日程|安排)/u],
+  ],
+  preference: [
+    ['response-format', /(回答|答复|顺序|结论|理由|细节|组织|表达|格式|先说|先看)/u],
+    ['address', /(称呼|叫我|名字)/u],
+    ['taste', /(吃|喝|菜|食物|口味|搭配|颜色|音乐|游戏|四格|盘)/u],
+    ['routine', /(习惯|通常|每天|默认|喜欢.*方式)/u],
+    ['media', /(书|电影|电视剧|动漫|音乐|游戏|作品)/u],
+  ],
+  relationship: [
+    ['shared-experience', /(一起|共同|那天|上次|第一次|纪念|回忆|经历)/u],
+    ['relationship-state', /(关系|家人|恋人|夫妻|朋友|亲近|信任)/u],
+  ],
+  emotion: [
+    ['stress', /(焦虑|压力|紧张|担心|害怕|恐惧)/u],
+    ['sleep', /(失眠|睡不着|做梦|疲惫|累)/u],
+    ['affection', /(想你|想念|委屈|孤单|依赖)/u],
+    ['mood', /(难过|开心|生气|烦|郁闷|高兴)/u],
+  ],
+  commitment: [
+    ['reminder', /(请记得|别忘|提醒|回来告诉|约定)/u],
+    ['promise', /(答应|承诺|保证)/u],
+    ['plan', /(准备|计划|打算|明天要|今晚会|下次|我会|将要)/u],
+    ['task', /(要做|完成|发给|处理|测试|修复|提交)/u],
+  ],
+  event: [
+    ['travel', /(旅行|旅游|出发|回来|去了|到过|景点|海边|机场)/u],
+    ['milestone', /(生日|纪念日|第一次|完成|上线|发布|搬迁|毕业)/u],
+    ['conflict', /(争吵|吵架|冲突|误会|道歉|和好)/u],
+    ['meal', /(吃了|饭菜|早餐|午餐|晚餐|点餐|菜盘)/u],
+    ['conversation', /(聊天|谈到|说过|讨论|提起|对话)/u],
+  ],
+})
+const CATEGORY_LABELS = Object.freeze({
+  fact: '事实',
+  preference: '偏好',
+  relationship: '关系',
+  emotion: '情绪',
+  commitment: '承诺',
+  event: '事件',
+})
 
 function now() {
   return new Date().toISOString()
@@ -166,7 +214,15 @@ function queryTopic(text) {
   if (/(称呼|叫我|名字)/u.test(value)) return 'preference:address'
   if (/(吃|喝|菜|食物|口味|搭配|颜色|音乐|游戏|四格|盘)/u.test(value)) return 'preference:taste'
   if (/(住在|居住|搬家|地址|城市|来自)/u.test(value)) return 'fact:residence'
+  if (/(焦虑|压力|紧张|担心|害怕|恐惧)/u.test(value)) return 'emotion:stress'
+  if (/(失眠|睡不着|做梦|疲惫|累)/u.test(value)) return 'emotion:sleep'
+  if (/(想你|想念|委屈|孤单|依赖)/u.test(value)) return 'emotion:affection'
+  if (/(难过|开心|生气|烦|郁闷|高兴)/u.test(value)) return 'emotion:mood'
   if (/(承诺|答应|要求.*记住|请记得|别忘|周五|约定|提醒|要做|未完成|还没完成)/u.test(value)) return 'commitment'
+  if (/(旅行|旅游|出发|回来|去了|到过|景点|海边|机场)/u.test(value)) return 'event:travel'
+  if (/(生日|纪念日|第一次|完成|上线|发布|搬迁|毕业)/u.test(value)) return 'event:milestone'
+  if (/(争吵|吵架|冲突|误会|道歉|和好)/u.test(value)) return 'event:conflict'
+  if (/(吃了|饭菜|早餐|午餐|晚餐|点餐|菜盘)/u.test(value)) return 'event:meal'
   if (/(一起|海边|贝壳|共同|关系|那天|经历|发生)/u.test(value)) return 'relationship'
   return null
 }
@@ -179,7 +235,9 @@ function stripRetrievalWrapper(text) {
 
 function topicMatches(memory, topic) {
   if (!topic || !memory) return false
-  if (memory.factKey === topic || memory.claimKey === topic) return true
+  if (memory.factKey === topic || memory.claimKey === topic
+    || memory.kind === topic
+    || `${memory.kind}:${memory.subcategory || ''}` === topic) return true
   const text = `${memory.summary || ''} ${memory.evidence || ''}`
   if (topic === 'preference:response-format') return memory.kind === 'preference' && /(回答|答复|顺序|结论|理由|细节|组织|表达|格式|先说|先看)/u.test(text)
   if (topic === 'preference:address') return memory.kind === 'preference' && /(称呼|叫我|名字)/u.test(text)
@@ -188,6 +246,12 @@ function topicMatches(memory, topic) {
   if (topic === 'commitment') return memory.kind === 'commitment'
   if (topic === 'relationship') return memory.kind === 'relationship'
   return false
+}
+
+function subcategoryFor(kind, text) {
+  const value = String(text || '')
+  const rules = SUBCATEGORY_RULES[kind] || []
+  return rules.find(([, pattern]) => pattern.test(value))?.[0] || 'other'
 }
 
 function parseJsonLoose(text) {
@@ -253,6 +317,7 @@ function classify(text, speaker) {
     || (/(改了|改成|现在)/u.test(value) && /(结论|证据|报告|背景|格式|称呼|喜欢|偏好)/u.test(value))) return 'preference'
   if (/(难过|开心|生气|焦虑|累|害怕|失眠|委屈|想你|想念)/u.test(value)) return 'emotion'
   if (/(我们|一起|那天|上次|第一次|纪念|发生)/u.test(value)) return 'relationship'
+  if (/(昨天|昨晚|刚才|后来|当时|结果|遇到|去了|旅行|旅游|吃了|看了|完成了|结束了|开始了|发生了)/u.test(value)) return 'event'
   if (speaker === 'user' && /(我|我的|我叫|我是|今天|昨天|明天|最近|正在|已经|准备|计划|住在|来自|工作|学习|发生)/u.test(value)) return 'fact'
   return null
 }
@@ -310,6 +375,7 @@ function normalizeMemoryRow(row) {
   const recordedAt = row.recordedAt || row.createdAt || row.occurredAt || now()
   return {
     ...row,
+    subcategory: row.subcategory || subcategoryFor(row.kind, `${row.summary || ''} ${row.evidence || ''}`),
     occurredAt: row.occurredAt || recordedAt,
     recordedAt,
     lastSeenAt: row.lastSeenAt || row.occurredAt || recordedAt,
@@ -346,6 +412,8 @@ class MemoryEngine {
       inputPerMillion: Number(options.modelCost?.inputPerMillion || 0),
       outputPerMillion: Number(options.modelCost?.outputPerMillion || 0),
     }
+    this.pricingModel = options.pricingModel || options.llmModel || 'deepseek-flash'
+    this.pricingPeak = options.pricingPeriod === 'peak' || options.pricingPeak === true
     this.sessions = new Map()
     this.turns = []
     this.memories = new Map()
@@ -362,12 +430,14 @@ class MemoryEngine {
       cacheWriteTokens: 0,
       totalTokens: 0,
       estimatedCostUsd: 0,
+      estimatedCostCny: 0,
     }
     this.llmStats = {
       calls: 0,
       jsonErrors: 0,
       evidenceRejected: 0,
       estimatedCostUsd: 0,
+      estimatedCostCny: 0,
     }
   }
 
@@ -409,6 +479,8 @@ class MemoryEngine {
       this.llmStats.jsonErrors += Number(row.jsonErrors || 0)
       this.llmStats.evidenceRejected += Number(row.evidenceRejected || 0)
       this.llmStats.estimatedCostUsd += Number(row.estimatedCostUsd || 0)
+      this.llmStats.estimatedCostCny += Number(row.estimatedCostCny || 0)
+      this.usage.estimatedCostCny += Number(row.estimatedCostCny || 0)
     }
     return this
   }
@@ -438,8 +510,10 @@ class MemoryEngine {
       cacheReadTokens: Number(usage.cacheReadTokens ?? 0),
       cacheWriteTokens: Number(usage.cacheWriteTokens ?? 0),
       totalTokens: Number(usage.totalTokens ?? usage.total_tokens ?? 0),
+      model: usage.model ?? this.pricingModel,
     }
     row.estimatedCostUsd = this.estimateCost(row)
+    row.estimatedCostCny = this.estimateDeepSeekCost(row).totalCny
     this.metricsRows.push(row)
     this.usage.modelCalls += 1
     this.usage.inputTokens += row.inputTokens
@@ -448,6 +522,7 @@ class MemoryEngine {
     this.usage.cacheWriteTokens += row.cacheWriteTokens
     this.usage.totalTokens += row.totalTokens
     this.usage.estimatedCostUsd += row.estimatedCostUsd
+    this.usage.estimatedCostCny += row.estimatedCostCny
     await this.append('metrics.jsonl', row)
   }
 
@@ -464,9 +539,10 @@ class MemoryEngine {
       purpose: metric.purpose ?? null,
       jsonErrors: Number(metric.jsonErrors || 0),
       evidenceRejected: Number(metric.evidenceRejected || 0),
-      estimatedCostUsd: Number(metric.estimatedCostUsd || 0),
+      estimatedCostUsd: Number(metric.estimatedCostUsd ?? 0),
       sessionId: metric.sessionId ?? null,
     }
+    row.estimatedCostCny = Number(metric.estimatedCostCny ?? this.estimateDeepSeekCost(row).totalCny)
     this.metricsRows.push(row)
     this.usage.modelCalls += 1
     this.usage.inputTokens += row.inputTokens
@@ -475,10 +551,12 @@ class MemoryEngine {
     this.usage.cacheWriteTokens += row.cacheWriteTokens
     this.usage.totalTokens += row.totalTokens
     this.usage.estimatedCostUsd += row.estimatedCostUsd
+    this.usage.estimatedCostCny += row.estimatedCostCny
     this.llmStats.calls += 1
     this.llmStats.jsonErrors += row.jsonErrors
     this.llmStats.evidenceRejected += row.evidenceRejected
     this.llmStats.estimatedCostUsd += row.estimatedCostUsd
+    this.llmStats.estimatedCostCny += row.estimatedCostCny
     await this.append('metrics.jsonl', row)
     return row
   }
@@ -489,6 +567,16 @@ class MemoryEngine {
     const input = Number(usage?.inputTokens ?? usage?.prompt_tokens ?? usage?.promptTokens ?? 0)
     const output = Number(usage?.outputTokens ?? usage?.completion_tokens ?? usage?.completionTokens ?? 0)
     return (input * this.modelCost.inputPerMillion + output * this.modelCost.outputPerMillion) / 1_000_000
+  }
+
+  estimateDeepSeekCost(usage, model = null) {
+    return calculateDeepSeekCost({
+      model: model || usage?.model || this.pricingModel,
+      inputTokens: usage?.inputTokens ?? usage?.prompt_tokens ?? usage?.promptTokens ?? 0,
+      outputTokens: usage?.outputTokens ?? usage?.completion_tokens ?? usage?.completionTokens ?? 0,
+      cacheReadTokens: usage?.cacheReadTokens ?? usage?.prompt_cache_hit_tokens ?? 0,
+      peak: this.pricingPeak,
+    })
   }
 
   async writeJson(file, value) {
@@ -551,6 +639,7 @@ class MemoryEngine {
     const candidate = {
       id: `memory_${randomUUID().replaceAll('-', '')}`,
       kind,
+      subcategory: subcategoryFor(kind, value),
       recordType: recordType(kind),
       subjectType: subjectType(kind),
       subject: speaker,
@@ -975,7 +1064,7 @@ class MemoryEngine {
           '只提取未来仍有价值的事实、偏好、关系事件、情绪状态和承诺。',
           '不要记录问题、寒暄、模型猜测或没有证据的内容。',
           '每条必须给出 sourceTurnIds，并且 evidence 必须是对应原话的连续片段。',
-          '输出严格 JSON：{"memories":[{"kind":"fact|preference|relationship|emotion|commitment","speaker":"user|assistant|both","summary":"短句","evidence":"原话片段","sourceTurnIds":["turn_id"],"factKey":"稳定对象.方面或空","importance":0到1}]}。',
+          '输出严格 JSON：{"memories":[{"kind":"fact|preference|relationship|emotion|commitment|event","subcategory":"可选子类","speaker":"user|assistant|both","summary":"短句","evidence":"原话片段","sourceTurnIds":["turn_id"],"factKey":"稳定对象.方面或空","importance":0到1}]}。',
         ].join('\n'),
       },
       { role: 'user', content: transcript },
@@ -1016,7 +1105,7 @@ class MemoryEngine {
         rejected++
         continue
       }
-      const kind = ['fact', 'preference', 'relationship', 'emotion', 'commitment'].includes(raw.kind) ? raw.kind : 'fact'
+      const kind = ['fact', 'preference', 'relationship', 'emotion', 'commitment', 'event'].includes(raw.kind) ? raw.kind : 'fact'
       const speaker = source.speaker
       if (raw.speaker === 'user' && speaker !== 'user') {
         rejected++
@@ -1047,6 +1136,7 @@ class MemoryEngine {
       const candidate = {
         id: `memory_${randomUUID().replaceAll('-', '')}`,
         kind: effectiveKind,
+        subcategory: subcategoryFor(effectiveKind, evidence),
         recordType: recordType(effectiveKind),
         subjectType: subjectType(effectiveKind),
         subject: speaker,
@@ -1197,12 +1287,23 @@ class MemoryEngine {
     }
     const recalls = this.events.filter((row) => row.type === 'recall')
     const autoInjects = this.events.filter((row) => row.type === 'auto-inject')
+    const categoryCounts = Object.fromEntries(Object.keys(CATEGORY_LABELS).map((kind) => [
+      kind,
+      [...this.memories.values()].filter((memory) => memory.kind === kind).length,
+    ]))
+    const subcategoryCounts = {}
+    for (const memory of this.memories.values()) {
+      const key = `${memory.kind}:${memory.subcategory || subcategoryFor(memory.kind, `${memory.summary || ''} ${memory.evidence || ''}`)}`
+      subcategoryCounts[key] = (subcategoryCounts[key] || 0) + 1
+    }
     return {
       root: this.root,
       sessions: this.sessions.size,
       turns: this.turns.length,
       memories: this.memories.size,
       activeMemories: this.list().length,
+      categoryCounts,
+      subcategoryCounts,
       events: this.events.length,
       storageBytes,
       recallCount: recalls.length,
@@ -1226,6 +1327,7 @@ function compactMemory(memory) {
   return {
     id: memory.id,
     kind: memory.kind,
+    subcategory: memory.subcategory,
     recordType: memory.recordType,
     subjectType: memory.subjectType,
     summary: memory.summary,
@@ -1235,6 +1337,9 @@ function compactMemory(memory) {
     occurredAt: memory.occurredAt,
     recordedAt: memory.recordedAt,
     lastRecalledAt: memory.lastRecalledAt,
+    factKey: memory.factKey,
+    claimType: memory.claimType,
+    epistemicStatus: memory.epistemicStatus,
     status: memory.status,
     writePriority: memory.writePriority,
   }

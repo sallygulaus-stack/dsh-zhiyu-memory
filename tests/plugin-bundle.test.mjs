@@ -24,6 +24,49 @@ test('DSH bundle 使用分类鲜活度并保留时间字段', async () => {
   assert.ok(strength(memory, '2026-11-22T00:00:00.000Z') > 0)
 })
 
+test('DSH bundle 为主分类补充稳定子类，并让子类参与主题检索', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'companion-plugin-subcategory-'))
+  const engine = await new MemoryEngine(root, 6).init()
+  const taste = await engine.ingest({
+    sessionId: 's1',
+    speaker: 'user',
+    text: '我喜欢把黄瓜和豆角分成四格菜盘。',
+    sourceKey: 'subcategory-taste',
+  })
+  const format = await engine.ingest({
+    sessionId: 's1',
+    speaker: 'user',
+    text: '我更喜欢先听结论，再听理由，最后看细节。',
+    sourceKey: 'subcategory-format',
+  })
+  const emotion = await engine.ingest({
+    sessionId: 's1',
+    speaker: 'user',
+    text: '我最近因为搬迁测试有点焦虑。',
+    sourceKey: 'subcategory-emotion',
+  })
+  const event = await engine.ingest({
+    sessionId: 's1',
+    speaker: 'user',
+    text: '昨天完成了服务器搬迁演练。',
+    sourceKey: 'subcategory-event',
+  })
+  assert.equal(taste.memory.subcategory, 'taste')
+  assert.equal(format.memory.subcategory, 'response-format')
+  assert.equal(emotion.memory.subcategory, 'stress')
+  assert.equal(event.memory.kind, 'event')
+  assert.equal(event.memory.subcategory, 'milestone')
+  const hits = await engine.recall('你记得我喜欢怎么搭配菜吗？', 's2')
+  assert.equal(hits[0].memory.id, taste.memory.id)
+  assert.equal(hits.some((hit) => hit.memory.id === format.memory.id), false)
+  const stats = await engine.stats()
+  assert.equal(stats.categoryCounts.preference, 2)
+  assert.equal(stats.categoryCounts.emotion, 1)
+  assert.equal(stats.categoryCounts.event, 1)
+  assert.equal(stats.subcategoryCounts['preference:taste'], 1)
+  assert.equal(stats.subcategoryCounts['event:milestone'], 1)
+})
+
 test('DSH bundle 新会话会注入父会话最近窗口，但不写成长期记忆', async () => {
   const root = await mkdtemp(join(tmpdir(), 'companion-parent-window-'))
   const engine = await new MemoryEngine(root, 6).init()
@@ -252,6 +295,24 @@ test('DSH bundle 低频整理拒绝无证据候选并记录成本指标', async 
   assert.ok(stats.llm.estimatedCostUsd > 0)
 })
 
+test('DSH bundle 使用 DeepSeek 价格表记录人民币估算费用', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'companion-plugin-pricing-'))
+  const engine = await new MemoryEngine(root, 6, {
+    pricingModel: 'deepseek-flash(1)',
+    pricingPeriod: 'peak',
+  }).init()
+  await engine.recordModelMetric({
+    model: 'DeepSeek-V4.1-Flash-1017',
+    purpose: 'pricing-test',
+    inputTokens: 1_000_000,
+    outputTokens: 100_000,
+    cacheReadTokens: 500_000,
+  })
+  const stats = await engine.stats()
+  assert.equal(stats.usage.estimatedCostCny, 1.82)
+  assert.equal(stats.llm.estimatedCostCny, 1.82)
+})
+
 test('DSH bundle 不让普通 LLM 候选覆盖明确记住的优先记忆', async () => {
   const root = await mkdtemp(join(tmpdir(), 'companion-plugin-priority-'))
   const engine = await new MemoryEngine(root, 6, {
@@ -335,6 +396,7 @@ test('DSH bundle 明确主题时优先召回同主题记忆，避免跨类别污
   const hits = await engine.recall('我喜欢你用什么顺序回答？', 's2')
   assert.ok(hits.length > 0)
   assert.equal(hits[0].memory.factKey, 'preference:response-format')
+  assert.equal(hits[0].memory.subcategory, 'response-format')
   assert.equal(hits.some((hit) => hit.memory.factKey === 'preference:taste'), false)
 })
 
