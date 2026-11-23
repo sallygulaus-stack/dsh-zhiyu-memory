@@ -13,6 +13,15 @@
       },
       "versions": [
         {
+          "version": "0.1.9",
+          "publishTimestamp": 1795413745,
+          "source": {
+            "type": "git",
+            "url": "https://github.com/sallygulaus-stack/dsh-zhiyu-memory",
+            "commit": "0ca0a0bd1b447cd12daa49cfa962b807b0fee889"
+          }
+        },
+        {
           "version": "0.1.8",
           "publishTimestamp": 1795413223,
           "source": {
