@@ -2,7 +2,7 @@ import { id, lexicalScore } from './util.mjs'
 
 export class CompanionMemoryAdapter {
   constructor(memory) {
-    this.name = 'dsh-companion-memory'
+    this.name = 'dsh-zhiyu-memory'
     this.memory = memory
   }
 
