@@ -12,15 +12,25 @@
   "main": "./plugin/lib/index.js",
   "exports": {
     ".": "./plugin/lib/index.js",
+    "./client": "./client.js",
     "./cordis.patch.yml": "./cordis.patch.yml"
   },
   "files": [
     "plugin/lib/index.js",
+    "plugin/lib/console.js",
+    "client.js",
     "cordis.patch.yml"
   ],
   "dsh": {
     "bundle": {
       "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "inject": [
+        "@deepseek-ai/dsh-client-runtime",
+        "@deepseek-ai/dsh-client-connection"
+      ],
+      "platform": "web"
     }
   },
   "scripts": {

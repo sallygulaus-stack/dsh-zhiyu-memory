@@ -2,6 +2,7 @@ import { appendFile, mkdir, readFile, rename, stat, writeFile } from 'node:fs/pr
 import { dirname, isAbsolute, join, resolve } from 'node:path'
 import { homedir } from 'node:os'
 import { createHash, randomUUID } from 'node:crypto'
+import { registerMemoryConsoleRoutes } from './console.js'
 
 const name = 'companion-memory'
 const inject = ['tools', 'systemPrompt', 'llm']
@@ -17,7 +18,10 @@ const HALF_LIFE_HOURS = {
 }
 const DEFAULT_DAILY_WRITE_BUDGET = 24
 const DEFAULT_SEMANTIC_THRESHOLD = 0.18
+const LEXICAL_STOP_CHARS = new Set('的了是我你他她它我们你们他们和与在于从到这那个也都一有没不要请记住什么哪吗呢吧会能可以已经还就按把为并且'.split(''))
 const SEMANTIC_HISTORY_QUERY = /(上次|以前|之前|那次|记得|共同|经历|当时|曾经|换个说法|有关)/u
+const IMPLICIT_REFERENCE_QUERY = /(刚才|刚刚|上一(?:轮|个对话|个会话)|上次|接着|继续|前面|之前说的|我们聊到|还没说完|那个|这种|这样|一样|照旧|还是|又来|再来)/u
+const PARENT_WINDOW_QUERY = IMPLICIT_REFERENCE_QUERY
 
 function now() {
   return new Date().toISOString()
@@ -139,7 +143,7 @@ function terms(text) {
   for (const token of value.match(/[\p{L}\p{N}_]+/gu) ?? []) {
     if (token.length > 1) result.add(token)
     if (/[\u3400-\u9fff]/u.test(token)) {
-      for (const char of token) result.add(char)
+      for (const char of token) if (!LEXICAL_STOP_CHARS.has(char)) result.add(char)
       for (let i = 0; i < token.length - 1; i++) result.add(token.slice(i, i + 2))
     }
   }
@@ -153,6 +157,37 @@ function lexicalScore(query, text) {
   let hits = 0
   for (const token of q) if (t.has(token)) hits++
   return hits / q.size
+}
+
+function queryTopic(text) {
+  const value = String(text || '')
+  if (/(回答|答复|顺序|结论|理由|细节|组织|表达|格式|先说|先看)/u.test(value)
+    && /(偏好|喜欢|顺序|结论|理由|细节|先说|先看)/u.test(value)) return 'preference:response-format'
+  if (/(称呼|叫我|名字)/u.test(value)) return 'preference:address'
+  if (/(吃|喝|菜|食物|口味|搭配|颜色|音乐|游戏|四格|盘)/u.test(value)) return 'preference:taste'
+  if (/(住在|居住|搬家|地址|城市|来自)/u.test(value)) return 'fact:residence'
+  if (/(承诺|答应|要求.*记住|请记得|别忘|周五|约定|提醒|要做|未完成|还没完成)/u.test(value)) return 'commitment'
+  if (/(一起|海边|贝壳|共同|关系|那天|经历|发生)/u.test(value)) return 'relationship'
+  return null
+}
+
+function stripRetrievalWrapper(text) {
+  return String(text || '')
+    .replace(/^不要调用记忆工具[，, ]*只依据系统上下文回答[；;，, ]*没有依据就明确说不知道[。.!！]*/u, '')
+    .trim()
+}
+
+function topicMatches(memory, topic) {
+  if (!topic || !memory) return false
+  if (memory.factKey === topic || memory.claimKey === topic) return true
+  const text = `${memory.summary || ''} ${memory.evidence || ''}`
+  if (topic === 'preference:response-format') return memory.kind === 'preference' && /(回答|答复|顺序|结论|理由|细节|组织|表达|格式|先说|先看)/u.test(text)
+  if (topic === 'preference:address') return memory.kind === 'preference' && /(称呼|叫我|名字)/u.test(text)
+  if (topic === 'preference:taste') return memory.kind === 'preference' && /(吃|喝|菜|食物|口味|搭配|颜色|音乐|游戏|四格|盘)/u.test(text)
+  if (topic === 'fact:residence') return memory.kind === 'fact' && /(住在|居住|搬家|地址|城市|来自)/u.test(text)
+  if (topic === 'commitment') return memory.kind === 'commitment'
+  if (topic === 'relationship') return memory.kind === 'relationship'
+  return false
 }
 
 function parseJsonLoose(text) {
@@ -198,6 +233,7 @@ function keyFor(kind, text) {
     if (/(称呼|叫我|名字)/u.test(text)) return 'preference:address'
     if (/(喜欢|不喜欢|讨厌).*(吃|喝|食物|颜色|音乐|游戏)/u.test(text)) return 'preference:taste'
   }
+  if (kind === 'fact' && /(住在|居住|搬到|搬家|地址|城市|来自)/u.test(text)) return 'fact:residence'
   return `${kind}:${normalize(text)
     .replace(/(我|你|她|他|我们|以后|现在|今天|最近|请|希望|记得|别忘了)/gu, '')
     .replace(/[，。！？、,.!?：:；;]/gu, ' ')
@@ -209,7 +245,8 @@ function classify(text, speaker) {
   if (!value.trim() || value.trim().length < 4 || LOW_VALUE.test(value.trim())) return null
   if (speaker === 'user' && MEMORY_META_QUERY.test(value)) return null
   if (/[?？]\s*$/u.test(value) || /^(你还记得|你记得|是什么|是否|能不能|可以吗|为什么|什么时候|哪一个|哪些)/u.test(value.trim())) return null
-  if (speaker === 'assistant' && /(我会|我答应|我记住|下次我|我会把)/u.test(value)) return 'commitment'
+  if (speaker === 'assistant' && isAssistantAcknowledgement(value)) return null
+  if (speaker === 'assistant' && /(我会|我答应|下次我|我会把)/u.test(value)) return 'commitment'
   if (speaker === 'assistant') return null
   if (speaker === 'user' && /(答应|承诺|请记得|别忘|下次|要不要提醒|回来告诉|我会|我准备|计划|今晚会|明天要)/u.test(value)) return 'commitment'
   if (/(喜欢|不喜欢|讨厌|偏好|习惯|称呼|叫我|希望你|不要叫)/u.test(value)
@@ -218,6 +255,15 @@ function classify(text, speaker) {
   if (/(我们|一起|那天|上次|第一次|纪念|发生)/u.test(value)) return 'relationship'
   if (speaker === 'user' && /(我|我的|我叫|我是|今天|昨天|明天|最近|正在|已经|准备|计划|住在|来自|工作|学习|发生)/u.test(value)) return 'fact'
   return null
+}
+
+function isAssistantAcknowledgement(text) {
+  const value = String(text || '').trim()
+  return /(?:好的?[，, ]*)?(?:收到|明白|了解|我)?(?:已经|已)?(?:记住了|记下了|记录好了|存好了)/u.test(value)
+    || /^(?:好的?[，, ]*)?(?:我会|以后我会|我将会|我会照着)(?:按|按照|照着).*(?:回答|记|执行)/u.test(value)
+    || /^(?:这条|这个)(?:偏好|约定|记忆).*(?:记住|记录|存下)/u.test(value)
+    || /(?:以后|默认)(?:我)?(?:按|会按|照着).*(?:回答|顺序|结论|理由|细节)/u.test(value)
+    || /(?:自动检索到|自动注入.*记忆|本会话.*记忆|当前.*上下文.*记忆|根据.*上下文.*记忆|系统上下文里.*记忆|这条记录|我没有调用.*记忆工具)/u.test(value)
 }
 
 function recordType(kind) {
@@ -547,9 +593,13 @@ class MemoryEngine {
     candidate.authority = authority
     candidate.polarity = semantic.polarity
     candidate.modality = semantic.modality
+    const explicitRemember = Boolean(forcedKind)
     candidate.epistemicStatus = authority === 'user'
-      && semantic.polarity === 'affirmed'
-      && ['assertion', 'promise'].includes(semantic.modality)
+      && ref
+      && (explicitRemember
+        ? !['question', 'wish', 'reported'].includes(semantic.modality)
+        : semantic.polarity === 'affirmed'
+          && ['assertion', 'promise'].includes(semantic.modality))
       ? 'accepted'
       : semantic.epistemicStatus
     candidate.visibility = candidate.epistemicStatus === 'accepted'
@@ -576,7 +626,8 @@ class MemoryEngine {
     if (candidate.status === 'review') return this.saveMemory(candidate, 'candidate-review')
     const existing = [...this.memories.values()]
       .filter((row) => !['superseded', 'deleted'].includes(row.status)
-        && row.kind === candidate.kind
+        && (row.kind === candidate.kind
+          || (row.factKey && candidate.factKey && row.factKey === candidate.factKey))
         && row.speaker === candidate.speaker
         && ((row.factKey && candidate.factKey && row.factKey === candidate.factKey)
           || Math.max(lexicalScore(row.summary, candidate.summary), lexicalScore(candidate.summary, row.summary)) >= 0.45))
@@ -603,6 +654,15 @@ class MemoryEngine {
         }
         this.events.push(event)
         await this.append('events.jsonl', event)
+        // Keep an auditable, non-recallable copy so a low-frequency model
+        // candidate cannot silently disappear when a user-priority claim wins.
+        candidate.status = 'review'
+        candidate.visibility = 'evidence-only'
+        candidate.epistemicStatus = 'candidate'
+        await this.saveMemory(candidate, 'candidate-review', {
+          protectedMemoryId: existing.id,
+          reason: 'priority-memory-protected',
+        })
         return existing
       }
       existing.status = 'superseded'
@@ -650,11 +710,12 @@ class MemoryEngine {
     return memory
   }
 
-  async retrieve(query, sessionId = null) {
+  async retrieve(query, sessionId = null, { logQuery = null, mode = 'tool' } = {}) {
     const started = Date.now()
-    const value = String(query ?? '')
+    const value = stripRetrievalWrapper(query)
     const commitmentIntent = /(承诺|答应|要求.*记住|别忘|记得|未完成|还没完成)/u.test(value)
     const relationshipIntent = /(我们|共同|关系|那次|上次发生|修复)/u.test(value)
+    const topic = queryTopic(value) || (commitmentIntent ? 'commitment' : relationshipIntent ? 'relationship' : null)
     const at = now()
     const candidates = [...this.memories.values()]
       .filter((row) => !['superseded', 'deleted'].includes(row.status) && candidateIsRecallable(row))
@@ -664,8 +725,12 @@ class MemoryEngine {
         const intent = commitmentIntent && row.kind === 'commitment' ? (row.speaker === 'user' ? 0.55 : 0.18) : relationshipIntent && row.kind === 'relationship' ? 0.4 : 0
         const sameSession = sessionId && row.sourceSessionId === sessionId ? 0.08 : 0
         const priorityBoost = row.writePriority === 'priority' ? 0.12 : 0
-        const score = lexical * 0.52 + recent * 0.1 + strength(row, at) * 0.12 + row.importance * 0.08 + intent + sameSession + priorityBoost
-        return { memory: row, score, lexical, semantic: false }
+        const topicMatch = topicMatches(row, topic)
+        const topicBoost = topic && topicMatch ? 0.3 : 0
+        const topicPenalty = topic && !topicMatch && lexical < 0.4 ? 0.35 : 0
+        const score = lexical * 0.52 + recent * 0.1 + strength(row, at) * 0.12 + row.importance * 0.08
+          + intent + sameSession + priorityBoost + topicBoost - topicPenalty
+        return { memory: row, score, lexical, semantic: false, topicMatch }
       })
     const lexicalMax = candidates.reduce((max, item) => Math.max(max, item.lexical), 0)
     let semanticUsed = false
@@ -681,10 +746,24 @@ class MemoryEngine {
       }
     }
     const hits = candidates
-      .filter((item) => item.lexical >= 0.12 || (commitmentIntent && item.memory.kind === 'commitment') || (relationshipIntent && item.memory.kind === 'relationship') || item.semantic)
+      .filter((item) => topic
+        ? (item.topicMatch || item.lexical >= 0.6 || item.semantic)
+        : (item.lexical >= 0.12
+          || (commitmentIntent && item.memory.kind === 'commitment')
+          || (relationshipIntent && item.memory.kind === 'relationship')
+          || item.semantic))
       .sort((a, b) => b.score - a.score)
       .slice(0, this.maxRecall)
-    this.events.push({ at, type: 'recall', query: value.slice(0, 180), durationMs: Date.now() - started, hitCount: hits.length, semanticUsed })
+    this.events.push({
+      at,
+      type: 'recall',
+      query: String(logQuery ?? value).slice(0, 180),
+      retrievalQuery: value !== String(logQuery ?? value) ? value.slice(0, 1800) : undefined,
+      mode,
+      durationMs: Date.now() - started,
+      hitCount: hits.length,
+      semanticUsed,
+    })
     await this.append('events.jsonl', this.events.at(-1))
     return hits
   }
@@ -783,14 +862,85 @@ class MemoryEngine {
   }
 
   async context(sessionId, query) {
-    const hits = await this.retrieve(query, sessionId)
-    if (!hits.length) return ''
-    const lines = [
-      '【伴生记忆回忆】',
-      '只把下面内容当作有来源的参考，不要把不确定内容说成事实。',
-      hits.map(({ memory }) => `- ${memory.kind}/${memory.status}: ${memory.summary}（来源：${memory.sourceTurnIds.join(',')}）`).join('\n'),
-    ]
-    return lines.join('\n').slice(0, 2400)
+    const originalQuery = String(query ?? '').trim()
+    const retrievalQuery = this.contextQuery(sessionId, originalQuery)
+    const hits = await this.retrieve(retrievalQuery, sessionId, {
+      logQuery: originalQuery,
+      mode: 'auto',
+    })
+    const session = this.sessions.get(sessionId)
+    const parentContext = this.parentWindowContext(session, originalQuery)
+    const lines = []
+    if (parentContext) lines.push(parentContext)
+    if (hits.length) {
+      lines.push(
+        '【伴生记忆回忆】',
+        '以下是自动检索到的有来源参考；普通连续性不需要再次调用记忆工具。只有需要完整原话、确认、纠正或删除时才调用工具。',
+        hits.map(({ memory, semantic }) => {
+          const evidence = String(memory.evidence || memory.summary || '').replace(/\s+/gu, ' ').slice(0, 160)
+          const occurred = memory.occurredAt ? String(memory.occurredAt).slice(0, 10) : '未知'
+          const match = semantic ? '语义关联' : '词面关联'
+          return `- ${memory.kind}/${memory.status}：${memory.summary}（证据：“${evidence}”；发生于 ${occurred}；来源：${memory.sourceTurnIds.join(',')}；${match}）`
+        }).join('\n'),
+      )
+    }
+    const context = lines.join('\n').slice(0, 3000)
+    const recallEvent = this.events.at(-1)
+    const autoEvent = {
+      at: now(),
+      type: 'auto-inject',
+      sessionId,
+      query: originalQuery.slice(0, 180),
+      retrievalExpanded: retrievalQuery !== originalQuery,
+      memoryIds: hits.map(({ memory }) => memory.id),
+      hitCount: hits.length,
+      parentWindow: Boolean(parentContext),
+      injected: Boolean(context),
+      injectedChars: context.length,
+      semanticUsed: Boolean(recallEvent?.type === 'recall' && recallEvent.semanticUsed),
+    }
+    this.events.push(autoEvent)
+    await this.append('events.jsonl', autoEvent)
+    return context
+  }
+
+  contextQuery(sessionId, query) {
+    const value = String(query || '').trim()
+    if (!value || !IMPLICIT_REFERENCE_QUERY.test(value)) return value
+    const session = this.sessions.get(sessionId)
+    const parentId = session?.parentSessionId
+    const currentTurns = this.turns
+      .filter((turn) => turn.sessionId === sessionId && !this.purgedTurnIds.has(turn.id))
+      .slice(-4)
+    const parentTurns = parentId
+      ? this.turns
+        .filter((turn) => turn.sessionId === parentId && !this.purgedTurnIds.has(turn.id))
+        .slice(-4)
+      : []
+    const nearby = [...parentTurns, ...currentTurns]
+      .map((turn) => `${turn.speaker === 'user' ? '用户' : turn.speaker === 'assistant' ? '助手' : '记录'}：${turn.text}`)
+      .filter(Boolean)
+    if (!nearby.length) return value
+    return [value, ...nearby].join('\n').slice(0, 1800)
+  }
+
+  parentWindowContext(session, query) {
+    const parentId = session?.parentSessionId
+    if (!parentId) return ''
+    const currentTurns = this.turns.filter((turn) => turn.sessionId === session.id)
+    if (currentTurns.length > 1 && !PARENT_WINDOW_QUERY.test(String(query || ''))) return ''
+    const parentTurns = this.turns
+      .filter((turn) => turn.sessionId === parentId && !this.purgedTurnIds.has(turn.id))
+      .slice(-4)
+    if (!parentTurns.length) return ''
+    const text = parentTurns
+      .map((turn) => `${turn.speaker === 'user' ? '用户' : turn.speaker === 'assistant' ? '助手' : '记录'}：${turn.text}`)
+      .join(' / ')
+    return [
+      '【上一会话最近内容】',
+      '以下只是上一会话的临时接话线索，不等于长期事实；需要时再用记忆工具核对。',
+      text,
+    ].join('\n').slice(0, 1200)
   }
 
   async consolidate() {
@@ -872,16 +1022,33 @@ class MemoryEngine {
         rejected++
         continue
       }
+      if (speaker === 'assistant' && isAssistantAcknowledgement(evidence)) {
+        rejected++
+        continue
+      }
       const occurredAt = sources.map((turn) => turn.occurredAt || turn.createdAt).sort()[0]
       const semantic = semanticState(evidence)
-      const claimType = claimTypeFor(evidence, kind, speaker)
+      const inferredKind = classify(evidence, speaker)
+      const effectiveKind = speaker === 'user'
+        && inferredKind
+        && inferredKind !== 'fact'
+        && !(inferredKind === 'commitment' && kind !== 'commitment')
+        ? inferredKind
+        : kind
+      const claimType = claimTypeFor(evidence, effectiveKind, speaker)
       const summary = String(raw.summary || evidence).trim()
       const summaryGrounded = normalize(summary) === normalize(evidence)
+        || (speaker === 'user'
+          && lexicalScore(summary, evidence) >= 0.2
+          && (!inferredKind || inferredKind === effectiveKind || kind === 'commitment')
+          && (keyFor(effectiveKind, summary) === keyFor(effectiveKind, evidence)
+            || effectiveKind === 'relationship'
+            || effectiveKind === 'commitment'))
       const candidate = {
         id: `memory_${randomUUID().replaceAll('-', '')}`,
-        kind,
-        recordType: recordType(kind),
-        subjectType: subjectType(kind),
+        kind: effectiveKind,
+        recordType: recordType(effectiveKind),
+        subjectType: subjectType(effectiveKind),
         subject: speaker,
         speaker,
         summary: summary.slice(0, 240),
@@ -902,7 +1069,7 @@ class MemoryEngine {
         confirmedRecallCount: 0,
         reinforcementCount: 0,
         freshness: 1,
-        status: kind === 'commitment' ? 'open' : 'active',
+        status: effectiveKind === 'commitment' ? 'open' : 'active',
         factKey,
         claimKey: factKey,
         claimType,
@@ -921,7 +1088,7 @@ class MemoryEngine {
         evidenceRefs: [ref],
         source: sourceIds.join(','),
         writePolicy: 'llm-evidence-grounded',
-        writePriority: ['commitment', 'relationship'].includes(kind) ? 'priority' : 'normal',
+        writePriority: ['commitment', 'relationship'].includes(effectiveKind) ? 'priority' : 'normal',
       }
       if (candidate.visibility === 'evidence-only') candidate.status = 'review'
       const saved = await this.remember(candidate)
@@ -1029,6 +1196,7 @@ class MemoryEngine {
       }
     }
     const recalls = this.events.filter((row) => row.type === 'recall')
+    const autoInjects = this.events.filter((row) => row.type === 'auto-inject')
     return {
       root: this.root,
       sessions: this.sessions.size,
@@ -1038,6 +1206,9 @@ class MemoryEngine {
       events: this.events.length,
       storageBytes,
       recallCount: recalls.length,
+      autoInjectCount: autoInjects.length,
+      autoInjectHitCount: autoInjects.reduce((sum, row) => sum + Number(row.hitCount || 0), 0),
+      autoInjectWithHits: autoInjects.filter((row) => Number(row.hitCount || 0) > 0).length,
       averageRecallMs: recalls.length
         ? Number((recalls.reduce((sum, row) => sum + Number(row.durationMs || 0), 0) / recalls.length).toFixed(2))
         : 0,
@@ -1170,11 +1341,24 @@ async function apply(ctx, config = {}) {
   ).init()
   const latestQuery = new Map()
   const assistantSeq = new Map()
+  let consoleDisposed
+  const ensureConsole = () => {
+    if (consoleDisposed !== undefined) return
+    const webServer = ctx.get('webServer')
+    if (!webServer) return
+    consoleDisposed = registerMemoryConsoleRoutes({ ctx, engine })
+  }
+  ensureConsole()
+  try {
+    ctx.inject(['webServer'], () => ensureConsole())
+  } catch {
+    // Headless compositions do not mount a web server; the memory tool still works.
+  }
 
   ctx.systemPrompt.section({
     name: 'companion-memory-guidance',
     order: (ctx.systemPrompt.getSectionOrder('TOOLS_SDK') ?? 5000) + 10,
-    text: '伴生记忆已启用。只把记忆工具返回的内容当作有来源参考；用户明确纠正、删除或要求忘记时，以最新要求为准。不要因为一次临时情绪或寒暄就扩大长期记忆。',
+    text: '伴生记忆已启用。插件会在每轮自动检索并注入相关记忆；普通连续性不需要重复调用 recall。只把自动注入或记忆工具返回的内容当作有来源参考；需要完整原话、确认、纠正或删除时再使用记忆工具。用户明确纠正、删除或要求忘记时，以最新要求为准。不要因为一次临时情绪或寒暄就扩大长期记忆。',
   })
   ctx.systemPrompt.context({
     name: 'companion-memory-recall',
@@ -1302,9 +1486,19 @@ async function apply(ctx, config = {}) {
   })
 
   return () => {
+    consoleDisposed?.()
     disposePreStep()
     disposeTurnStopping()
   }
 }
 
-export { apply, inject, name, MemoryEngine, freshness, strength, compactMemory, compactRecallHits }
+export {
+  apply,
+  inject,
+  name,
+  MemoryEngine,
+  freshness,
+  strength,
+  compactMemory,
+  compactRecallHits,
+}

@@ -38,6 +38,10 @@ test('木偶记忆迁移保留来源链、时间字段并区分关系与承诺',
     tags: ['生活'],
   }) + '\n')
   await writeFile(join(root, 'behavior', 'memo.jsonl'), '')
+  await writeFile(join(root, 'behavior', 'core-state.md'), '【最近在办】继续验证新记忆插件。')
+  await writeFile(join(root, 'behavior', 'core.md'), '【红线】不要泄露隐私。')
+  await writeFile(join(root, 'behavior', 'core-rules.md'), '说错了直接改口。')
+  await writeFile(join(root, 'behavior', 'persona.md'), '# 人设\n- 角色卡负责身份。')
 
   const archive = await migratePuppetMemory(root, { exportedAt: '2026-11-22T00:00:00.000Z' })
   assert.equal(archive.schema, 'dsh-companion-memory/archive@2')
@@ -45,6 +49,15 @@ test('木偶记忆迁移保留来源链、时间字段并区分关系与承诺',
   assert.ok(archive.turns.length >= 3)
   assert.ok(archive.memories.some((memory) => memory.kind === 'relationship'))
   assert.ok(archive.memories.some((memory) => memory.kind === 'commitment'))
+  assert.equal(
+    archive.memories.find((memory) => memory.sourceFile === 'behavior/core-state.md')?.writePriority,
+    'priority',
+  )
+  assert.deepEqual(archive.metadata.preservedHostFiles, [
+    'behavior/persona.md',
+    'behavior/core.md',
+    'behavior/core-rules.md',
+  ])
   for (const memory of archive.memories) {
     assert.ok(memory.occurredAt)
     assert.ok(memory.recordedAt)

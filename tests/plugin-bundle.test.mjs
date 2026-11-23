@@ -24,6 +24,99 @@ test('DSH bundle 使用分类鲜活度并保留时间字段', async () => {
   assert.ok(strength(memory, '2026-11-22T00:00:00.000Z') > 0)
 })
 
+test('DSH bundle 新会话会注入父会话最近窗口，但不写成长期记忆', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'companion-parent-window-'))
+  const engine = await new MemoryEngine(root, 6).init()
+  await engine.ingest({
+    sessionId: 'parent',
+    speaker: 'user',
+    text: '第三版先放着，我们接着看第四版。',
+    sourceKey: 'parent-window-user',
+  })
+  await engine.ingest({
+    sessionId: 'parent',
+    speaker: 'assistant',
+    text: '好，第四版的迁移清单还没有收尾。',
+    sourceKey: 'parent-window-assistant',
+  })
+  await engine.session('child', 'parent')
+  const context = await engine.context('child', '就按刚才说的继续吧')
+  assert.match(context, /上一会话最近内容/u)
+  assert.match(context, /第四版/u)
+  assert.equal(engine.memories.size, 1)
+})
+
+test('DSH bundle 自动注入会带证据和发生时间，不依赖模型主动调用 recall', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'companion-auto-inject-'))
+  const engine = await new MemoryEngine(root, 6).init()
+  const saved = await engine.ingest({
+    sessionId: 's1',
+    speaker: 'user',
+    text: '我喜欢把黄瓜、豆角和萝卜条分成四格。',
+    sourceKey: 'meal-preference',
+    occurredAt: '2026-11-20T12:00:00.000Z',
+  })
+  const context = await engine.context('s1', '你还记得我喜欢怎么搭配吗？')
+  assert.match(context, /伴生记忆回忆/u)
+  assert.match(context, /黄瓜、豆角和萝卜条/u)
+  assert.match(context, /发生于 2026-11-20/u)
+  assert.match(context, new RegExp(saved.memory.sourceTurnIds[0]))
+  const auto = engine.events.findLast((event) => event.type === 'auto-inject')
+  assert.equal(auto.hitCount, 1)
+  assert.deepEqual(auto.memoryIds, [saved.memory.id])
+  assert.equal(auto.injected, true)
+  assert.equal((await engine.stats()).autoInjectHitCount, 1)
+})
+
+test('DSH bundle 会用近期对话展开“那个/这种”指代后再自动注入', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'companion-auto-reference-'))
+  const engine = await new MemoryEngine(root, 6).init()
+  const saved = await engine.ingest({
+    sessionId: 's1',
+    speaker: 'user',
+    text: '我喜欢把黄瓜、豆角和萝卜条分成四格。',
+    sourceKey: 'meal-preference',
+    occurredAt: '2026-11-20T12:00:00.000Z',
+  })
+  await engine.ingest({
+    sessionId: 's1',
+    speaker: 'assistant',
+    text: '好，我记住你说的这份四格小菜搭配了。',
+    sourceKey: 'meal-followup',
+  })
+  const context = await engine.context('s1', '今天还是那个搭配。')
+  assert.match(context, /黄瓜、豆角和萝卜条/u)
+  const recall = engine.events.findLast((event) => event.type === 'recall')
+  assert.equal(recall.mode, 'auto')
+  assert.equal(recall.query, '今天还是那个搭配。')
+  assert.match(recall.retrievalQuery, /四格小菜搭配/u)
+  assert.ok(engine.events.findLast((event) => event.type === 'auto-inject').memoryIds.includes(saved.memory.id))
+})
+
+test('DSH bundle 的明确 remember 可以保存可召回的否定事实，但问题仍隔离', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'companion-explicit-negative-'))
+  const engine = await new MemoryEngine(root, 6).init()
+  const negative = await engine.ingest({
+    sessionId: 's1',
+    speaker: 'user',
+    text: '项目还没有收尾。',
+    sourceKey: 'explicit-negative',
+    forcedKind: 'fact',
+    writePriority: 'priority',
+  })
+  assert.equal(negative.memory.visibility, 'recallable')
+  assert.equal(negative.memory.epistemicStatus, 'accepted')
+  const question = await engine.ingest({
+    sessionId: 's1',
+    speaker: 'user',
+    text: '项目是不是已经收尾？',
+    sourceKey: 'explicit-question',
+    forcedKind: 'fact',
+    writePriority: 'priority',
+  })
+  assert.equal(question.memory.visibility, 'evidence-only')
+})
+
 test('DSH bundle 的软每日配额只限制普通写入', async () => {
   const root = await mkdtemp(join(tmpdir(), 'companion-plugin-budget-'))
   const engine = await new MemoryEngine(root, 6, { dailyWriteBudget: 1 }).init()
@@ -196,6 +289,53 @@ test('DSH bundle 不让普通 LLM 候选覆盖明确记住的优先记忆', asyn
   assert.equal(saved.writePriority, 'priority')
   assert.equal(engine.list().filter((item) => item.status === 'superseded').length, 0)
   assert.ok(engine.list().some((item) => item.status === 'review'))
+})
+
+test('DSH bundle 不把助手的记住确认话术写成新的长期记忆', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'companion-plugin-ack-'))
+  const engine = await new MemoryEngine(root, 6).init()
+  await engine.ingest({
+    sessionId: 's1',
+    speaker: 'assistant',
+    text: '好的，我记住了。以后我会按结论、原因、细节的顺序回答。',
+    sourceKey: 'assistant-ack-1',
+  })
+  assert.equal(engine.list().length, 0)
+  await engine.ingest({
+    sessionId: 's1',
+    speaker: 'assistant',
+    text: '结论：已经记下了。根据系统上下文里自动检索到的记录，你住在苏州市；我会继续按这个前提回答。',
+    sourceKey: 'assistant-ack-2',
+  })
+  assert.equal(engine.list().length, 0)
+  await engine.ingest({
+    sessionId: 's1',
+    speaker: 'assistant',
+    text: '根据本会话自动注入的记忆，你周五答应的是把蓝图发给我。',
+    sourceKey: 'assistant-ack-3',
+  })
+  assert.equal(engine.list().length, 0)
+})
+
+test('DSH bundle 明确主题时优先召回同主题记忆，避免跨类别污染', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'companion-plugin-topic-'))
+  const engine = await new MemoryEngine(root, 6).init()
+  await engine.ingest({
+    sessionId: 's1',
+    speaker: 'user',
+    text: '我喜欢吃黄瓜、豆角和萝卜条，最好放在四格菜盘里。',
+    sourceKey: 'taste-1',
+  })
+  await engine.ingest({
+    sessionId: 's1',
+    speaker: 'user',
+    text: '我更喜欢先听结论，再听理由，最后看细节。',
+    sourceKey: 'format-1',
+  })
+  const hits = await engine.recall('我喜欢你用什么顺序回答？', 's2')
+  assert.ok(hits.length > 0)
+  assert.equal(hits[0].memory.factKey, 'preference:response-format')
+  assert.equal(hits.some((hit) => hit.memory.factKey === 'preference:taste'), false)
 })
 
 test('DSH bundle 从来源推导 assistant 主体并隔离否定内容', async () => {

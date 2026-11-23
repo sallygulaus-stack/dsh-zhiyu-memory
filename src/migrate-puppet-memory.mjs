@@ -37,7 +37,10 @@ function normalize(value) {
 }
 
 function textFor(row) {
-  return String(row?.note || row?.text || row?.quote || row?.proof || '').trim()
+  const keyword = String(row?.keyword || '').trim()
+  const body = String(row?.note || row?.text || row?.meaning || row?.quote || row?.proof || '').trim()
+  if (keyword && body && !body.startsWith(keyword)) return `${keyword}：${body}`
+  return body || keyword
 }
 
 function kindFor(row, sourceFile) {
@@ -133,7 +136,7 @@ function addMemory({ memories, memoryKeys, sessions, turns, row, sourceFile, ind
   const session = sessions.get(sessionId)
   session.turnCount += 1
   if (new Date(occurredAt) > new Date(session.lastTurnAt)) session.lastTurnAt = occurredAt
-  const summary = String(row.note || row.text || row.quote || evidence).trim().slice(0, 240)
+  const summary = textFor(row).slice(0, 240)
   const key = canonicalKey(kind, summary)
   const existing = memoryKeys.get(key)
   if (existing) {
@@ -173,7 +176,11 @@ function addMemory({ memories, memoryKeys, sessions, turns, row, sourceFile, ind
     status: statusFor(row, kind),
     factKey: `${sourceFile}:${row.keyword || rowHash}`,
     writePolicy: 'migration',
-    writePriority: ['relationship', 'commitment'].includes(kind) ? 'priority' : 'normal',
+    writePriority: ['relationship', 'commitment'].includes(kind)
+      || sourceFile === 'behavior/core-state.md'
+      || row?.important === true
+      ? 'priority'
+      : 'normal',
   }
   memories.push(memory)
   memoryKeys.set(key, memory)
@@ -236,6 +243,27 @@ export async function migratePuppetMemory(root, { exportedAt = nowIso() } = {}) 
   const importantRows = []
   const recordedAt = exportedAt
 
+  // Preserve the current-state card as a high-priority, evidence-backed claim.
+  // Persona and rules remain host configuration; they must not become user facts.
+  const coreState = await readFile(join(behavior, 'core-state.md'), 'utf8').catch(() => '')
+  if (coreState.trim()) {
+    addMemory({
+      memories,
+      memoryKeys,
+      sessions,
+      turns,
+      row: {
+        kind: 'event',
+        text: coreState.trim(),
+        tags: ['当前状态'],
+        ts: recordedAt,
+      },
+      sourceFile: 'behavior/core-state.md',
+      index: 0,
+      recordedAt,
+    })
+  }
+
   for (const month of ['2026-10', '2026-11']) {
     const rows = await readJsonl(join(behavior, 'diary', `${month}.jsonl`))
     addDiaryTurns({
@@ -280,6 +308,11 @@ export async function migratePuppetMemory(root, { exportedAt = nowIso() } = {}) 
       migratedFrom: PUPPET_MIGRATION_VERSION,
       sourceRoot: relative(process.cwd(), root),
       policy: 'diary-kept-as-evidence; durable rows imported selectively; guide/index excluded to avoid duplicate prompt material',
+      preservedHostFiles: [
+        'behavior/persona.md',
+        'behavior/core.md',
+        'behavior/core-rules.md',
+      ],
       sourceFiles: sources.map(([file, rows]) => ({ file, rows: rows.length })),
     },
     sessions: [...sessions.values()],
