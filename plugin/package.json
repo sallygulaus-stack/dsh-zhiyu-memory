@@ -1,0 +1,24 @@
+{
+  "name": "dsh-zhiyu-memory",
+  "version": "0.1.5",
+  "private": true,
+  "type": "module",
+  "description": "她记得住你说过的话，也记得清是哪一句。记忆会按类型自然变淡，记错了能改，不想提能删。",
+  "main": "lib/index.js",
+  "exports": {
+    ".": "./lib/index.js",
+    "./cordis.patch.yml": "./cordis.patch.yml"
+  },
+  "files": [
+    "lib/index.js",
+    "lib/console.js",
+    "lib/pricing.js",
+    "cordis.patch.yml",
+    "说明.md"
+  ],
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    }
+  }
+}
