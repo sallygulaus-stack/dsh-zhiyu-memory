@@ -21,9 +21,18 @@ function responseRecorder() {
   }
 }
 
-function contextFor(routes) {
+function contextFor(routes, { auth = true, rejection } = {}) {
   const ctx = {
     get(name) {
+      if (name === 'connection' && auth) return {
+        requestRejection: () => rejection,
+        authorizeIndex(req, res) {
+          if (req.browserSession !== false) return true
+          res.writeHead(401, {})
+          res.end()
+          return false
+        },
+      }
       return name === 'webServer' ? {
         register(route) {
           routes.set(route.path, route)
@@ -73,6 +82,20 @@ test('记忆观察面板注册网页和只读数据路由', async () => {
   assert.ok(data.stats.storageBytes >= 0)
   dispose()
   assert.equal(routes.size, 0)
+})
+
+test('记忆观察面板未经 DSH 浏览器鉴权不读取记忆数据', async () => {
+  const routes = new Map()
+  registerMemoryConsoleRoutes({ ctx: contextFor(routes, { auth: false }), engine: null })
+  assert.equal(routes.size, 0)
+  for (const [options, expected] of [[{}, 401], [{ rejection: 401 }, 401], [{ rejection: 403 }, 403]]) {
+    registerMemoryConsoleRoutes({ ctx: contextFor(routes, options), engine: null })
+    for (const route of routes.values()) {
+      const res = responseRecorder()
+      await route.handler({ method: 'GET', browserSession: false }, res)
+      assert.equal(res.status, expected)
+    }
+  }
 })
 
 test('记忆观察面板拒绝写请求，不提供未确认的修改入口', async () => {

@@ -133,22 +133,38 @@ function evidenceRef(turn, quote) {
   }
 }
 
-function candidateIsRecallable(memory) {
+function anchoredPuppetSource(memory, turns) {
+  if (memory.sourceKind !== 'puppet-memory'
+    || memory.visibility !== 'evidence-only'
+    || memory.epistemicStatus !== 'candidate'
+    || memory.migrationStatus !== 'quarantined'
+    || memory.migrationReason !== 'legacy-span-speaker-polarity-unverified'
+    || memory.speaker !== 'user'
+    || !/^behavior\/diary\/\d{4}-\d{2}\.jsonl$/u.test(memory.sourceFile ?? '')) return false
+  const quote = String(memory.evidence || '').trim()
+  const summary = String(memory.summary || '').trim()
+  if (quote.length < 4 || !summary || !quote.startsWith(summary) || !Array.isArray(memory.sourceTurnIds)
+    || /[?？]|(?:如果|要是|假如|可能|也许|听说|据说)/u.test(quote)) return false
+  return memory.sourceTurnIds.find((id) => {
+    const source = turns.get(id)
+    return source?.speaker === 'user'
+      && source.sourceKind === 'puppet-memory'
+      && source.sourceFile === memory.sourceFile
+      && source.sessionId === memory.sourceSessionId
+      && String(source.text ?? '').includes(quote)
+  }) || false
+}
+
+function candidateIsRecallable(memory, verifiedLegacy = false) {
   // `recall-block` 只把 visibility 改成 'hidden'，原来这里只比对 'evidence-only'，
   // 于是「已阻断召回」的记忆照样被检索出来。deletionState 与 visibility 任一处标记都算阻断。
-  // 木偶迁移条目虽然沿用 evidence-only 标记，但它们自带真实迁移来源回合；
-  // 允许这类有证据的历史条目进入候选，不能把无来源的模型候选一并放行。
-  const migratedWithEvidence = memory?.sourceKind === 'puppet-memory'
-    && Array.isArray(memory?.sourceTurnIds)
-    && memory.sourceTurnIds.length > 0
-    && String(memory?.evidence || '').trim().length > 0
-  return (memory?.visibility !== 'evidence-only' || migratedWithEvidence)
+  return (memory?.visibility !== 'evidence-only' || verifiedLegacy)
     && memory?.visibility !== 'hidden'
     && !['deleted', 'superseded', 'hidden', 'review'].includes(memory?.status)
     && memory?.deletionState !== 'purged'
     && memory?.deletionState !== 'recall-blocked'
     && (['accepted', 'supported', undefined, null].includes(memory?.epistemicStatus)
-      || (migratedWithEvidence && memory?.epistemicStatus === 'candidate'))
+      || verifiedLegacy)
 }
 
 function localEndOfDay(iso, timeZone = 'UTC', dayOffset = 0) {
@@ -212,6 +228,14 @@ function lexicalScore(query, text) {
   let hits = 0
   for (const token of q) if (t.has(token)) hits++
   return hits / q.size
+}
+
+function puppetQueryAnchors(query) {
+  const focused = normalize(query).replace(
+    /你还记得|你记得|还记得|记不记得|接着|继续|之前|以前|上次|那次|关于|事情|什么|怎样|怎么|哪些|我们|爸爸|聊吧|(?<=[\p{Script=Han}])(?:吗|呢|吧)(?=[\p{P}\s]|$)/gu,
+    ' ',
+  )
+  return [...terms(focused)].filter((token) => [...token].length >= 2)
 }
 
 function queryTopic(text) {
@@ -813,9 +837,14 @@ class MemoryEngine {
     const relationshipIntent = /(我们|共同|关系|那次|上次发生|修复)/u.test(value)
     const topic = queryTopic(value) || (commitmentIntent ? 'commitment' : relationshipIntent ? 'relationship' : null)
     const at = now()
+    const legacyTurns = new Map(this.turns
+      .filter((turn) => turn.sourceKind === 'puppet-memory' && !this.purgedTurnIds.has(turn.id))
+      .map((turn) => [turn.id, turn]))
+    const legacyAnchors = puppetQueryAnchors(value)
     const candidates = [...this.memories.values()]
-      .filter((row) => !['superseded', 'deleted'].includes(row.status) && candidateIsRecallable(row))
-      .map((row) => {
+      .flatMap((row) => {
+        const legacy = anchoredPuppetSource(row, legacyTurns)
+        if (!candidateIsRecallable(row, legacy)) return []
         const lexical = lexicalScore(value, `${row.summary} ${row.evidence} ${row.factKey}`)
         const recent = freshness(row, at)
         const intent = commitmentIntent && row.kind === 'commitment' ? (row.speaker === 'user' ? 0.55 : 0.18) : relationshipIntent && row.kind === 'relationship' ? 0.4 : 0
@@ -826,7 +855,13 @@ class MemoryEngine {
         const topicPenalty = topic && !topicMatch && lexical < 0.4 ? 0.35 : 0
         const score = lexical * 0.52 + recent * 0.1 + strength(row, at) * 0.12 + row.importance * 0.08
           + intent + sameSession + priorityBoost + topicBoost - topicPenalty
-        return { memory: row, score, lexical, semantic: false, topicMatch }
+        if (legacy) {
+          const sourceTerms = terms(row.evidence)
+          const anchors = legacyAnchors.filter((token) => sourceTerms.has(token)).length
+          if (!anchors) return []
+          return [{ memory: row, score: anchors / legacyAnchors.length * 0.72 + lexical * 0.18 + recent * 0.05, lexical, semantic: false, topicMatch, legacy }]
+        }
+        return [{ memory: row, score, lexical, semantic: false, topicMatch }]
       })
     const lexicalMax = candidates.reduce((max, item) => Math.max(max, item.lexical), 0)
     let semanticUsed = false
@@ -842,12 +877,12 @@ class MemoryEngine {
       }
     }
     const hits = candidates
-      .filter((item) => topic
+      .filter((item) => item.legacy || (topic
         ? (item.topicMatch || item.lexical >= 0.6 || item.semantic)
         : (item.lexical >= 0.2
           || (commitmentIntent && item.memory.kind === 'commitment')
           || (relationshipIntent && item.memory.kind === 'relationship')
-          || item.semantic))
+          || item.semantic)))
       .sort((a, b) => b.score - a.score)
       .slice(0, this.maxRecall)
     this.events.push({
@@ -972,11 +1007,12 @@ class MemoryEngine {
       lines.push(
         '【伴生记忆回忆】',
         '以下是自动检索到的有来源参考；普通连续性不需要再次调用记忆工具。只有需要完整原话、确认、纠正或删除时才调用工具。',
-        hits.map(({ memory, semantic }) => {
+        hits.map(({ memory, semantic, legacy }) => {
           const evidence = String(memory.evidence || memory.summary || '').replace(/\s+/gu, ' ').slice(0, 160)
           const occurred = memory.occurredAt ? String(memory.occurredAt).slice(0, 10) : '未知'
           const match = semantic ? '语义关联' : '词面关联'
-          return `- ${memory.kind}/${memory.status}：${memory.summary}（证据：“${evidence}”；发生于 ${occurred}；来源：${memory.sourceTurnIds.join(',')}；${match}）`
+          const provenance = legacy ? '迁移对话用户原话（历史陈述，不等于当前事实）' : '证据'
+          return `- ${memory.kind}/${memory.status}：${memory.summary}（${provenance}：“${evidence}”；发生于 ${occurred}；来源：${legacy || memory.sourceTurnIds.join(',')}；${match}）`
         }).join('\n'),
       )
     }
@@ -1457,12 +1493,12 @@ async function apply(ctx, config = {}) {
   const ensureConsole = () => {
     if (consoleDisposed !== undefined) return
     const webServer = ctx.get('webServer')
-    if (!webServer) return
+    if (!webServer || !ctx.get('connection')) return
     consoleDisposed = registerMemoryConsoleRoutes({ ctx, engine })
   }
   ensureConsole()
   try {
-    ctx.inject(['webServer'], () => ensureConsole())
+    ctx.inject(['webServer', 'connection'], () => ensureConsole())
   } catch {
     // Headless compositions do not mount a web server; the memory tool still works.
   }

@@ -1,6 +1,6 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
-import { mkdtemp } from 'node:fs/promises'
+import { mkdtemp, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { MemoryEngine, compactRecallHits, freshness, strength } from '../plugin/lib/index.js'
@@ -111,63 +111,58 @@ test('DSH bundle 自动注入会带证据和发生时间，不依赖模型主动
   assert.equal((await engine.stats()).autoInjectHitCount, 1)
 })
 
-test('DSH bundle 允许有来源回合的木偶迁移记忆参与召回，但仍隔离无来源 evidence-only 候选', async () => {
+test('DSH bundle 只在具体词组匹配时召回能核实聊天原话的木偶迁移条目', async () => {
   const root = await mkdtemp(join(tmpdir(), 'companion-puppet-recall-'))
-  const engine = await new MemoryEngine(root, 6).init()
-  const turn = await engine.ingest({
-    sessionId: 'puppet-import-test',
-    speaker: 'external',
-    text: '爸爸喜欢把晚餐分成四格菜盘。',
-    sourceKey: 'puppet:test:1',
-  })
-  const source = await engine.remember({
-    id: 'memory_puppet_test',
-    kind: 'preference',
-    subcategory: 'taste',
-    recordType: 'entity',
-    subjectType: 'person',
-    subject: 'user',
+  const sourceFile = 'behavior/diary/2026-11.jsonl'
+  const text = '我喜欢把晚餐分成四格菜盘。'
+  const at = new Date().toISOString()
+  const turn = {
+    id: 'original',
+    sessionId: 'legacy-session',
     speaker: 'user',
-    summary: turn.turn.text,
-    evidence: turn.turn.text,
-    sourceTurnIds: [turn.turn.id],
-    sourceSessionId: 'puppet-import-test',
+    text,
+    sourceFile,
+    occurredAt: at,
     sourceKind: 'puppet-memory',
-    visibility: 'evidence-only',
-    status: 'active',
-    epistemicStatus: 'candidate',
-    factKey: 'preference:taste',
-    claimKey: 'preference:taste',
-    importance: 0.8,
-    strength: 0.8,
-    source: turn.turn.id,
-  })
-  const blocked = await engine.remember({
-    id: 'memory_model_candidate',
+  }
+  const base = {
+    id: 'verified',
     kind: 'preference',
     subcategory: 'taste',
-    recordType: 'entity',
-    subjectType: 'person',
-    subject: 'user',
     speaker: 'user',
-    summary: '我可能喜欢别的搭配。',
-    evidence: '我可能喜欢别的搭配。',
-    sourceTurnIds: [],
-    sourceSessionId: 'model-candidate',
-    sourceKind: 'consolidation',
+    sourceKind: 'puppet-memory',
+    migrationStatus: 'quarantined',
+    migrationReason: 'legacy-span-speaker-polarity-unverified',
+    summary: text,
+    evidence: text,
+    sourceTurnIds: [turn.id],
+    sourceSessionId: turn.sessionId,
+    sourceFile,
+    occurredAt: at,
     visibility: 'evidence-only',
     status: 'active',
     epistemicStatus: 'candidate',
-    factKey: 'preference:other',
-    claimKey: 'preference:other',
     importance: 0.8,
     strength: 0.8,
-    source: 'none',
-  })
-  const hits = await engine.recall('你记得我喜欢怎么搭配晚餐吗？', 'fresh-session')
-  assert.equal(hits[0].memory.id, source.id)
-  assert.equal(hits.some((hit) => hit.memory.id === blocked.id), false)
-  assert.equal((await engine.recall('今天东京天气怎么样？', 'fresh-session')).length, 0)
+  }
+  const external = { ...turn, id: 'external', speaker: 'external', sourceKind: 'puppet-memory-record' }
+  await writeFile(join(root, 'turns.jsonl'), [turn, external].map((row) => JSON.stringify(row)).join('\n'))
+  await writeFile(join(root, 'memories.json'), JSON.stringify([
+    base,
+    { ...base, id: 'external-record', sourceTurnIds: [external.id] },
+    { ...base, id: 'missing', sourceTurnIds: ['missing'] },
+    { ...base, id: 'misquoted', summary: '晚餐有番茄', evidence: '晚餐有番茄' },
+    { ...base, id: 'wrong-session', sourceSessionId: 'other-session' },
+    { ...base, id: 'blocked', deletionState: 'recall-blocked' },
+    { ...base, id: 'model', sourceKind: 'consolidation' },
+  ]))
+  const engine = await new MemoryEngine(root, 6).init()
+  const hits = await engine.recall('你还记得我喜欢怎么搭配晚餐吗？', 'fresh-session')
+  assert.deepEqual(hits.map((hit) => hit.memory.id), ['verified'])
+  assert.match(await engine.context('fresh-session', '继续聊之前的四格菜盘'), /迁移对话用户原话/u)
+  for (const query of ['今天东京天气怎么样？', '我们接着聊之前关于头像的事情吧']) {
+    assert.equal(await engine.context('fresh-session', query), '')
+  }
 })
 
 test('DSH bundle 会用近期对话展开“那个/这种”指代后再自动注入', async () => {

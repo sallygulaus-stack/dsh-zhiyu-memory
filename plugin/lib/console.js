@@ -109,11 +109,21 @@ $('refresh').onclick=load;$('search').oninput=renderList;$('kind').onchange=()=>
 
 function registerMemoryConsoleRoutes({ ctx, engine }) {
   const webServer = ctx.get('webServer')
-  if (!webServer?.register) return () => {}
+  const connection = ctx.get('connection')
+  if (!webServer?.register || !connection?.requestRejection || !connection?.authorizeIndex) return () => {}
+  const authorize = (req, res) => {
+    const rejection = connection.requestRejection(req)
+    if (rejection !== undefined) {
+      sendConsoleJson(res, rejection, { error: rejection === 403 ? 'forbidden' : 'unauthorized' })
+      return false
+    }
+    return connection.authorizeIndex(req, res)
+  }
   const page = webServer.register({
     kind: 'exact',
     path: MEMORY_CONSOLE_PATH,
     handler: async (req, res) => {
+      if (!authorize(req, res)) return
       if (req.method !== 'GET' && req.method !== 'HEAD') {
         sendConsoleJson(res, 405, { error: 'method-not-allowed' })
         return
@@ -131,6 +141,7 @@ function registerMemoryConsoleRoutes({ ctx, engine }) {
     kind: 'exact',
     path: `${MEMORY_CONSOLE_PATH}/data`,
     handler: async (req, res) => {
+      if (!authorize(req, res)) return
       if (req.method !== 'GET' && req.method !== 'HEAD') {
         sendConsoleJson(res, 405, { error: 'method-not-allowed' })
         return
