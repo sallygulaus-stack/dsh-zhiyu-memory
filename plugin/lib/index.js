@@ -30,6 +30,14 @@ const PAST_MEAL = /(?:吃了|吃过|点了|点过|那顿饭|昨晚的(?:饭|菜)
 const REVIEWED_HISTORY_QUERY = /上(?:回|次)|以前|之前|曾经|当时|那天|那次|还?记得|说过|发过|送过|聊过|做过|提过/u
 const FOCAL_STOP_WORDS = new Set('还是 希望 想要 喜欢 偏好 习惯 不要 知道 可以 这个 那个 这个事 这样 那样 那份 那套 那顿 那天 一样 原样 照旧 继续 接着 上次 上回 今天 今晚 最近 昨天 刚才 那次 搭配 记住 记得 内容 怎么 什么 当然 然后 我们 以前 之后 当时 晚餐 午餐 早餐 晚饭 吃饭 饭菜 夜宵 吃法'.split(' '))
 const FADED_MEMORY_STRENGTH = 0.08
+const RUNTIME_INJECTION_MARKERS = Object.freeze([
+  /【角色卡(?:\s*——|已在本会话|请调用)/u,
+  /【当前角色】[\s\S]{0,160}【(?:你的身份|会话令牌)】/u,
+  /【会话令牌】[\s\S]{0,240}(?:qq_|readThroughSeq|调用二代状态工具)/u,
+  /【此刻状态】[\s\S]{0,240}【当前唤醒】/u,
+  /【当前唤醒】[\s\S]{0,240}【行动前】/u,
+  /完整角色卡(?:请调用|已在本会话前面完整给过)/u,
+])
 const SUBCATEGORY_RULES = Object.freeze({
   fact: [
     ['residence', /(住在|居住|搬到|搬家|地址|城市|来自)/u],
@@ -389,6 +397,16 @@ function classify(text, speaker) {
   return null
 }
 
+function isRuntimeInjection(text, speaker, forcedKind = null) {
+  // DSH may prepend a large runtime prompt as a user-sourced message. It is
+  // context for the current turn, not a user claim, so do not persist it.
+  if (speaker !== 'user' || forcedKind) return false
+  const value = String(text || '').trim()
+  if (value.length < 80) return false
+  const header = /^【当前时间】/u.test(value) || /^【当前角色】/u.test(value)
+  return header && RUNTIME_INJECTION_MARKERS.some((pattern) => pattern.test(value))
+}
+
 function isAssistantAcknowledgement(text) {
   const value = String(text || '').trim()
   return /(?:好的?[，, ]*)?(?:收到|明白|了解|我)?(?:已经|已)?(?:记住了|记下了|记录好了|存好了)/u.test(value)
@@ -690,6 +708,21 @@ class MemoryEngine {
     if (!value || (sourceKey && this.seenSources.has(sourceKey))) return { stored: false, reason: 'duplicate-or-empty' }
     if (!['user', 'assistant', 'system', 'external'].includes(speaker)) {
       throw new Error(`invalid turn speaker: ${speaker}`)
+    }
+    if (isRuntimeInjection(value, speaker, forcedKind)) {
+      const event = {
+        at: now(),
+        type: 'write-filtered',
+        reason: 'internal-runtime-injection',
+        sessionId,
+        sourceKey: sourceKey ?? null,
+        textHash: sha256(value),
+        textLength: value.length,
+      }
+      this.events.push(event)
+      if (sourceKey) this.seenSources.add(sourceKey)
+      await this.append('events.jsonl', event)
+      return { stored: false, filtered: true, reason: 'internal-runtime-injection' }
     }
     await this.session(sessionId, parentSessionId)
     const turn = {
@@ -1442,6 +1475,9 @@ class MemoryEngine {
       autoInjectCount: autoInjects.length,
       autoInjectHitCount: autoInjects.reduce((sum, row) => sum + Number(row.hitCount || 0), 0),
       autoInjectWithHits: autoInjects.filter((row) => Number(row.hitCount || 0) > 0).length,
+      filteredRuntimeInjections: this.events.filter((row) => (
+        row.type === 'write-filtered' && row.reason === 'internal-runtime-injection'
+      )).length,
       averageRecallMs: recalls.length
         ? Number((recalls.reduce((sum, row) => sum + Number(row.durationMs || 0), 0) / recalls.length).toFixed(2))
         : 0,

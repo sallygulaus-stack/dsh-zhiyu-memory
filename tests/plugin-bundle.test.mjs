@@ -398,6 +398,59 @@ test('DSH bundle 的明确 remember 请求强制写入事实', async () => {
   assert.equal(engine.list().length, 1)
 })
 
+test('DSH bundle 过滤角色卡运行时注入，不写入回合或长期记忆', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'companion-plugin-runtime-filter-'))
+  const engine = await new MemoryEngine(root, 6).init()
+  const runtimePrompt = [
+    '【当前时间】2026/11/24 00:02:11（Asia/Shanghai）',
+    '【当前角色】女儿（完整角色卡请调用 qq_get_prompt 查看）',
+    '【你的身份】你在 QQ 上的昵称是「沈知鱼」',
+    '【会话令牌】token-for-this-turn',
+    '【当前唤醒】private:909227066',
+    '【行动前】先判断当前消息是否需要回复。',
+  ].join('\n')
+  const result = await engine.ingest({
+    sessionId: 's1',
+    speaker: 'user',
+    text: runtimePrompt,
+    sourceKey: 'runtime-prompt-1',
+  })
+  assert.equal(result.stored, false)
+  assert.equal(result.reason, 'internal-runtime-injection')
+  assert.equal(engine.turns.length, 0)
+  assert.equal(engine.list().length, 0)
+  assert.equal((await engine.stats()).filteredRuntimeInjections, 1)
+})
+
+test('DSH bundle 不会因用户正常提到当前时间而误过滤', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'companion-plugin-runtime-text-'))
+  const engine = await new MemoryEngine(root, 6).init()
+  const result = await engine.ingest({
+    sessionId: 's1',
+    speaker: 'user',
+    text: '我正在记录当前时间字段，周五继续测试迁移。',
+    sourceKey: 'normal-runtime-wording-1',
+  })
+  assert.equal(result.stored, true)
+  assert.ok(result.memory)
+  assert.equal((await engine.stats()).filteredRuntimeInjections, 0)
+})
+
+test('明确 remember 可以有意保存包含运行时标记的内容', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'companion-plugin-runtime-explicit-'))
+  const engine = await new MemoryEngine(root, 6, { dailyWriteBudget: 0 }).init()
+  const result = await engine.ingest({
+    sessionId: 's1',
+    speaker: 'user',
+    text: '【当前时间】这个字段是测试数据格式的一部分。',
+    sourceKey: 'explicit-runtime-wording-1',
+    forcedKind: 'fact',
+    writePriority: 'priority',
+  })
+  assert.equal(result.stored, true)
+  assert.ok(result.memory)
+})
+
 test('DSH bundle 的优先记忆在大量旧记忆中仍能进入召回窗口', async () => {
   const root = await mkdtemp(join(tmpdir(), 'companion-plugin-priority-recall-'))
   const engine = await new MemoryEngine(root, 2).init()
