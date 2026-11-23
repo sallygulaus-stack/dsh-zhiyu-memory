@@ -809,7 +809,7 @@ class MemoryEngine {
   async retrieve(query, sessionId = null, { logQuery = null, mode = 'tool' } = {}) {
     const started = Date.now()
     const value = stripRetrievalWrapper(query)
-    const commitmentIntent = /(承诺|答应|要求.*记住|别忘|记得|未完成|还没完成)/u.test(value)
+    const commitmentIntent = /(承诺|答应|要求.*记住|别忘|未完成|还没完成)/u.test(value)
     const relationshipIntent = /(我们|共同|关系|那次|上次发生|修复)/u.test(value)
     const topic = queryTopic(value) || (commitmentIntent ? 'commitment' : relationshipIntent ? 'relationship' : null)
     const at = now()
@@ -844,7 +844,7 @@ class MemoryEngine {
     const hits = candidates
       .filter((item) => topic
         ? (item.topicMatch || item.lexical >= 0.6 || item.semantic)
-        : (item.lexical >= 0.12
+        : (item.lexical >= 0.2
           || (commitmentIntent && item.memory.kind === 'commitment')
           || (relationshipIntent && item.memory.kind === 'relationship')
           || item.semantic))

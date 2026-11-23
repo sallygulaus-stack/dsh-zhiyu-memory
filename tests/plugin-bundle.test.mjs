@@ -167,6 +167,7 @@ test('DSH bundle 允许有来源回合的木偶迁移记忆参与召回，但仍
   const hits = await engine.recall('你记得我喜欢怎么搭配晚餐吗？', 'fresh-session')
   assert.equal(hits[0].memory.id, source.id)
   assert.equal(hits.some((hit) => hit.memory.id === blocked.id), false)
+  assert.equal((await engine.recall('今天东京天气怎么样？', 'fresh-session')).length, 0)
 })
 
 test('DSH bundle 会用近期对话展开“那个/这种”指代后再自动注入', async () => {
