@@ -67,6 +67,8 @@ test('记忆观察面板注册网页和只读数据路由', async () => {
   assert.match(pageResponse.body, /来源与状态/u)
   assert.match(pageResponse.body, /自动注入命中/u)
   assert.match(pageResponse.body, /分类概览|事实|偏好/u)
+  assert.match(pageResponse.body, /data-retention="daily"/u)
+  assert.match(pageResponse.body, /日常/u)
 
   const dataResponse = responseRecorder()
   await routes.get('/companion-memory/console/data').handler({ method: 'GET', url: '/' }, dataResponse)
