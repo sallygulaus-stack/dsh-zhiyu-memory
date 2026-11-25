@@ -1560,6 +1560,8 @@ class MemoryEngine {
       const key = `${memory.kind}:${memory.subcategory || subcategoryFor(memory.kind, `${memory.summary || ''} ${memory.evidence || ''}`)}`
       subcategoryCounts[key] = (subcategoryCounts[key] || 0) + 1
     }
+    const dailyMemories = [...this.memories.values()].filter((memory) => memory.retentionClass === 'daily').length
+    const promotedMemories = [...this.memories.values()].filter((memory) => memory.promotionState === 'promoted').length
     return {
       root: this.root,
       sessions: this.sessions.size,
@@ -1568,6 +1570,8 @@ class MemoryEngine {
       activeMemories: this.list().length,
       categoryCounts,
       subcategoryCounts,
+      dailyMemories,
+      promotedMemories,
       events: this.events.length,
       storageBytes,
       recallCount: recalls.length,

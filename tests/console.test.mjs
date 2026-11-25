@@ -84,6 +84,38 @@ test('记忆观察面板注册网页和只读数据路由', async () => {
   assert.equal(routes.size, 0)
 })
 
+test('记忆观察面板显示日常保留层与自动晋升信息', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'companion-console-daily-'))
+  const engine = await new MemoryEngine(root, 6).init()
+  await engine.ingest({
+    sessionId: 'daily-console-1',
+    speaker: 'user',
+    text: '今晚一起看神舟发射吧。',
+    sourceKey: 'daily-console-1',
+    occurredAt: '2026-11-22T10:00:00.000Z',
+  })
+  await engine.ingest({
+    sessionId: 'daily-console-2',
+    speaker: 'user',
+    text: '今晚一起看神舟发射吧。',
+    sourceKey: 'daily-console-2',
+    occurredAt: '2026-11-23T10:00:00.000Z',
+  })
+  const routes = new Map()
+  registerMemoryConsoleRoutes({ ctx: contextFor(routes), engine })
+  const pageResponse = responseRecorder()
+  await routes.get('/companion-memory/console').handler({ method: 'GET', url: '/' }, pageResponse)
+  assert.match(pageResponse.body, /日常记忆/u)
+  assert.match(pageResponse.body, /已自动晋升/u)
+  assert.match(pageResponse.body, /日常到期/u)
+  const dataResponse = responseRecorder()
+  await routes.get('/companion-memory/console/data').handler({ method: 'GET', url: '/' }, dataResponse)
+  const data = JSON.parse(dataResponse.body)
+  assert.equal(data.stats.dailyMemories, 0)
+  assert.equal(data.stats.promotedMemories, 1)
+  assert.equal(data.memories[0].promotionState, 'promoted')
+})
+
 test('记忆观察面板未经 DSH 浏览器鉴权不读取记忆数据', async () => {
   const routes = new Map()
   registerMemoryConsoleRoutes({ ctx: contextFor(routes, { auth: false }), engine: null })
