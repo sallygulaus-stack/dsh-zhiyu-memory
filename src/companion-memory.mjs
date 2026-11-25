@@ -19,10 +19,13 @@ const DECAY_HALF_LIFE_HOURS = Object.freeze({
   event: 24 * 21,
   emotion: 24 * 14,
 })
+const DAILY_MEMORY_HALF_LIFE_HOURS = 48
+const DAILY_MEMORY_RETENTION_DAYS = 7
 
 const LOW_VALUE_TURNS = /^(你好|嗨|哈[哈呵]+|嗯+|哦+|好的?|好呀|收到|谢谢|谢了|晚安|早安|ok|okay)$/iu
 const SEMANTIC_HISTORY_QUERY = /(上次|以前|之前|那次|记得|共同|经历|当时|曾经|换个说法|有关)/u
 const MEMORY_META_QUERY = /(companion_memory|使用.*(记忆|recall|remember|consolidate)|测试数据|不要编造|只根据.*记忆)/iu
+const DAILY_EVENT = /(?:(?:今天|今晚|明天|刚才|待会|这两天|最近).{0,24}(?:一起|我们|咱们|看|吃|喝|聊|玩|等|追|做|发射|比赛|直播|电影|饭|饺子))|(?:(?:一起|我们|咱们).{0,18}(?:看|吃|喝|聊|玩|等|追|做|去|守着|等着))/u
 
 function kindFor(text, speaker) {
   const value = String(text)
@@ -30,6 +33,9 @@ function kindFor(text, speaker) {
   const isQuestion = /[?？]\s*$/u.test(value)
     || /^(你还记得|你记得|应该怎么|怎么组织|是什么|是否|能不能|可以吗|为什么|什么时候|哪一个|哪些)/u.test(value.trim())
   if (isQuestion) return null
+  if (speaker === 'user'
+    && DAILY_EVENT.test(value)
+    && !/(请记得|请记住|记得|别忘|答应|承诺|提醒)/u.test(value)) return 'event'
   if (speaker === 'assistant' && /(我会|我答应|我记住|下次我|我会把)/u.test(value)) return 'commitment'
   if (speaker === 'user' && /(答应|承诺|请记得|别忘|下次|要不要提醒|回来告诉|我会|我准备|计划|今晚会|明天要)/u.test(value)) return 'commitment'
   if (/(喜欢|不喜欢|讨厌|偏好|习惯|称呼|叫我|希望你|不要叫)/u.test(value)
@@ -67,6 +73,33 @@ function importanceFor(kind, text) {
   return clamp(score)
 }
 
+function isDailyMemory(kind, text) {
+  return kind === 'event' && DAILY_EVENT.test(String(text))
+}
+
+function dailyExpiresAt(occurredAt) {
+  const value = new Date(occurredAt)
+  if (Number.isNaN(value.getTime())) return null
+  value.setUTCDate(value.getUTCDate() + DAILY_MEMORY_RETENTION_DAYS)
+  return value.toISOString()
+}
+
+function shouldPromoteDaily(memory, candidate) {
+  if (memory.retentionClass !== 'daily') return false
+  if (candidate.retentionClass !== 'daily') return true
+  const sessions = new Set([
+    ...(memory.supportSessionIds || []),
+    memory.sourceSessionId,
+    candidate.sourceSessionId,
+  ].filter(Boolean))
+  const dates = new Set([
+    ...(memory.supportDates || []),
+    dayKey(memory.occurredAt),
+    dayKey(candidate.occurredAt),
+  ].filter(Boolean))
+  return sessions.size >= 2 || (dates.size >= 2 && Number(memory.reinforcementCount || 0) >= 2)
+}
+
 function keyFor(kind, text) {
   if (kind === 'preference') {
     if (/(结论|证据|报告|背景|格式|组织|呈现|先看)/u.test(text)) return 'preference:response-format'
@@ -83,7 +116,9 @@ function keyFor(kind, text) {
 function freshness(memory, now) {
   const seenAt = new Date(memory.lastReinforcedAt || memory.lastSupportedAt || memory.lastSeenAt || memory.occurredAt || memory.recordedAt).getTime()
   const ageHours = Math.max(0, (new Date(now).getTime() - seenAt) / 3_600_000)
-  const halfLife = decayHalfLifeHours(memory.kind)
+  const halfLife = memory.retentionClass === 'daily'
+    ? DAILY_MEMORY_HALF_LIFE_HOURS
+    : decayHalfLifeHours(memory.kind)
   return clamp(Math.pow(0.5, ageHours / halfLife), 0.02, 1)
 }
 
@@ -99,7 +134,9 @@ export function memoryStrength(memory, now) {
   const confirmedRecalls = Number(memory.confirmedRecallCount ?? memory.recallCount ?? 0)
   const rehearsals = confirmedRecalls + Number(memory.reinforcementCount || 0)
   const rehearsalBoost = Math.min(0.35, Math.log2(rehearsals + 1) * 0.08)
-  const halfLife = decayHalfLifeHours(memory.kind)
+  const halfLife = memory.retentionClass === 'daily'
+    ? DAILY_MEMORY_HALF_LIFE_HOURS
+    : decayHalfLifeHours(memory.kind)
   return clamp((base + rehearsalBoost) * Math.pow(0.5, ageHours / halfLife), 0, 1)
 }
 
@@ -230,6 +267,12 @@ export class CompanionMemory {
       lastRecalledAt: null,
       importance: important,
       strength: important,
+      retentionClass: isDailyMemory(kind, text) ? 'daily' : 'durable',
+      dailyExpiresAt: isDailyMemory(kind, text) ? dailyExpiresAt(turn.createdAt) : null,
+      promotionScore: isDailyMemory(kind, text) ? 0.25 : 1,
+      promotionState: isDailyMemory(kind, text) ? 'watching' : 'durable',
+      supportSessionIds: [turn.sessionId],
+      supportDates: [dayKey(turn.createdAt)],
       recallCount: 0,
       confirmedRecallCount: 0,
       reinforcementCount: 0,
@@ -286,13 +329,49 @@ export class CompanionMemory {
           && lexicalScore(existing.summary, candidate.summary) >= 0.4
           && !/(改成|改为|不再|现在不|以前.*现在)/u.test(candidate.summary))
       if (same) {
+        const sourceTurnIds = new Set(existing.sourceTurnIds || [])
+        const newEvidence = (candidate.sourceTurnIds || []).some((turnId) => !sourceTurnIds.has(turnId))
         existing.lastSeenAt = candidate.lastSeenAt
         existing.lastSupportedAt = candidate.lastSupportedAt || candidate.lastSeenAt
         existing.freshness = 1
         existing.evidence = candidate.evidence
         existing.sourceTurnIds = [...new Set([...(existing.sourceTurnIds || []), ...(candidate.sourceTurnIds || [])])]
         existing.evidenceRefs = [...(existing.evidenceRefs || []), ...(candidate.evidenceRefs || [])]
-        existing.reinforcementCount = Number(existing.reinforcementCount || 0) + 1
+        if (newEvidence) {
+          existing.reinforcementCount = Number(existing.reinforcementCount || 0) + 1
+          existing.supportSessionIds = [...new Set([
+            ...(existing.supportSessionIds || []),
+            existing.sourceSessionId,
+            candidate.sourceSessionId,
+          ].filter(Boolean))]
+          existing.supportDates = [...new Set([
+            ...(existing.supportDates || []),
+            dayKey(existing.occurredAt),
+            dayKey(candidate.occurredAt),
+          ].filter(Boolean))]
+          if (existing.retentionClass === 'daily') {
+            existing.promotionScore = clamp(
+              Number(existing.promotionScore || 0.25)
+                + (existing.supportSessionIds.length > 1 ? 0.4 : 0.2),
+            )
+          }
+        }
+        if (newEvidence && shouldPromoteDaily(existing, candidate)) {
+          existing.retentionClass = 'durable'
+          existing.dailyExpiresAt = null
+          existing.promotionState = 'promoted'
+          existing.promotedAt = this.clock().toISOString()
+          existing.promotionReason = candidate.retentionClass === 'daily'
+            ? 'cross-session-or-cross-day-rehearsal'
+            : 'later-durable-evidence'
+          existing.importance = Math.max(Number(existing.importance || 0), 0.72)
+          existing.strength = Math.max(Number(existing.strength || 0), existing.importance)
+          await this.store.upsertMemory(existing, {
+            type: 'promote',
+            reason: existing.promotionReason,
+          })
+          return existing
+        }
         await this.store.upsertMemory(existing, { type: 'refresh', source: candidate.source })
         return existing
       }
@@ -343,6 +422,7 @@ export class CompanionMemory {
     const relationshipIntent = /(我们|共同|关系|那次|上次发生|修复)/u.test(String(query))
     const memories = this.store.listMemories()
       .filter((memory) => !['superseded', 'deleted'].includes(memory.status))
+      .filter((memory) => !memory.dailyExpiresAt || new Date(memory.dailyExpiresAt).getTime() > new Date(now).getTime())
       .map((memory) => {
         const lexical = lexicalScore(query, `${memory.summary} ${memory.evidence} ${memory.factKey}`)
         const recent = freshness(memory, now)
@@ -641,7 +721,9 @@ export class CompanionMemory {
         } else if (!memory.dueAt && freshness(memory, now) < 0.1) {
           memory.status = 'stale'
         }
-      } else if (memory.status === 'active' && memory.effectiveStrength < 0.08) {
+      } else if (memory.status === 'active'
+        && ((memory.dailyExpiresAt && new Date(memory.dailyExpiresAt).getTime() <= new Date(now).getTime())
+          || memory.effectiveStrength < 0.08)) {
         memory.status = 'faded'
       }
       await this.store.upsertMemory(memory, { type: 'consolidate' })
@@ -672,7 +754,7 @@ export class CompanionMemory {
             '只提取未来仍有价值的事实、偏好、关系事件、情绪状态和承诺。',
             '不要记录问题本身、寒暄、临时措辞、模型猜测或没有证据的内容。',
             '每条必须给出 sourceTurnIds，并且 evidence 必须是对应原话的连续片段。',
-            '输出严格 JSON：{"memories":[{"kind":"fact|preference|relationship|emotion|commitment","speaker":"user|assistant|both","summary":"短句","evidence":"原话片段","sourceTurnIds":["turn_id"],"factKey":"稳定对象.方面或空","importance":0到1,"status":"active|open"}]}。',
+            '输出严格 JSON：{"memories":[{"kind":"fact|preference|relationship|emotion|commitment|event","speaker":"user|assistant|both","summary":"短句","evidence":"原话片段","sourceTurnIds":["turn_id"],"factKey":"稳定对象.方面或空","importance":0到1,"status":"active|open"}]}。',
           ].join('\n'),
         },
         { role: 'user', content: transcript },
@@ -703,7 +785,7 @@ export class CompanionMemory {
         rejected++
         continue
       }
-      const kind = ['fact', 'preference', 'relationship', 'emotion', 'commitment'].includes(raw.kind)
+      const kind = ['fact', 'preference', 'relationship', 'emotion', 'commitment', 'event'].includes(raw.kind)
         ? raw.kind
         : 'fact'
       const speaker = ['user', 'assistant', 'both'].includes(raw.speaker)
@@ -735,6 +817,12 @@ export class CompanionMemory {
         lastRecalledAt: null,
         importance: clamp(raw.importance, 0.2, 1),
         strength: clamp(raw.importance, 0.2, 1),
+        retentionClass: isDailyMemory(kind, evidence) ? 'daily' : 'durable',
+        dailyExpiresAt: isDailyMemory(kind, evidence) ? dailyExpiresAt(occurredAt) : null,
+        promotionScore: isDailyMemory(kind, evidence) ? 0.25 : 1,
+        promotionState: isDailyMemory(kind, evidence) ? 'watching' : 'durable',
+        supportSessionIds: [sessionId],
+        supportDates: [dayKey(occurredAt)],
         recallCount: 0,
         confirmedRecallCount: 0,
         reinforcementCount: 0,

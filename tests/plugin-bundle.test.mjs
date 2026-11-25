@@ -3,7 +3,30 @@ import assert from 'node:assert/strict'
 import { mkdtemp, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { MemoryEngine, compactRecallHits, freshness, strength } from '../plugin/lib/index.js'
+import { apply, MemoryEngine, compactRecallHits, freshness, strength } from '../plugin/lib/index.js'
+
+test('DSH bundle 指示按当前回合状态判断工具可用性并要求持久化回执', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'companion-guidance-'))
+  const sections = []
+  const ctx = {
+    get: () => undefined,
+    inject: () => {},
+    on: () => () => {},
+    tools: { register: () => {} },
+    systemPrompt: {
+      section: (section) => sections.push(section),
+      context: () => {},
+      getSectionOrder: () => 5000,
+      getContextOrder: () => 200,
+    },
+  }
+  const dispose = await apply(ctx, { root })
+  const guidance = sections.find((section) => section.name === 'companion-memory-guidance')?.text ?? ''
+  assert.match(guidance, /历史回合出现过的拒绝或白名单错误，不代表工具当前仍不可用/u)
+  assert.match(guidance, /只有本次调用返回失败，才能说这次没有写入/u)
+  assert.match(guidance, /stored=true 且带有记忆 ID/u)
+  dispose()
+})
 
 test('DSH bundle 使用分类鲜活度并保留时间字段', async () => {
   const root = await mkdtemp(join(tmpdir(), 'companion-plugin-'))
@@ -379,6 +402,48 @@ test('DSH bundle 的软每日配额只限制普通写入', async () => {
   assert.equal(second.memory, null)
   assert.ok(priority.memory)
   assert.ok(engine.events.some((event) => event.type === 'write-suppressed'))
+})
+
+test('DSH bundle 日常共同事件会跨会话自动晋升', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'companion-plugin-daily-promotion-'))
+  const engine = await new MemoryEngine(root, 6).init()
+  const first = await engine.ingest({
+    sessionId: 'daily-first',
+    speaker: 'user',
+    text: '今晚一起看神舟发射吧。',
+    sourceKey: 'daily-first-1',
+    occurredAt: '2026-11-22T10:00:00.000Z',
+  })
+  assert.equal(first.candidate.kind, 'event')
+  assert.equal(first.candidate.retentionClass, 'daily')
+  const second = await engine.ingest({
+    sessionId: 'daily-second',
+    speaker: 'user',
+    text: '今晚一起看神舟发射吧。',
+    sourceKey: 'daily-second-1',
+    occurredAt: '2026-11-23T10:00:00.000Z',
+  })
+  assert.equal(second.memory.retentionClass, 'durable')
+  assert.equal(second.memory.promotionState, 'promoted')
+  assert.ok(engine.events.some((event) => event.type === 'promote'))
+})
+
+test('DSH bundle 日常事件过期后不再自动注入', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'companion-plugin-daily-expiry-'))
+  const engine = await new MemoryEngine(root, 6).init()
+  const result = await engine.ingest({
+    sessionId: 'daily-expiry',
+    speaker: 'user',
+    text: '今晚一起看神舟发射吧。',
+    sourceKey: 'daily-expiry-1',
+    occurredAt: '2026-11-22T10:00:00.000Z',
+  })
+  const hits = await engine.retrieve('神舟发射', 'daily-expiry', { mode: 'auto' })
+  assert.equal(hits.length, 1)
+  result.memory.dailyExpiresAt = '2026-11-20T10:00:00.000Z'
+  await engine.saveMemory(result.memory, 'test-expiry')
+  const expired = await engine.retrieve('神舟发射', 'daily-expiry', { mode: 'auto' })
+  assert.equal(expired.length, 0)
 })
 
 test('DSH bundle 的明确 remember 请求强制写入事实', async () => {

@@ -17,11 +17,14 @@ const HALF_LIFE_HOURS = {
   event: 24 * 21,
   emotion: 24 * 14,
 }
+const DAILY_MEMORY_HALF_LIFE_HOURS = 48
+const DAILY_MEMORY_RETENTION_DAYS = 7
 const DEFAULT_DAILY_WRITE_BUDGET = 24
 const DEFAULT_SEMANTIC_THRESHOLD = 0.18
 const PARENT_WINDOW_MAX_AGE_MS = 72 * 3600000
 const LEXICAL_STOP_CHARS = new Set('的了是我你他她它我们你们他们和与在于从到这那个也都一有没不要请记住什么哪吗呢吧会能可以已经还就按把为并且'.split(''))
 const SEMANTIC_HISTORY_QUERY = /(上次|以前|之前|那次|记得|共同|经历|当时|曾经|换个说法|有关)/u
+const DAILY_EVENT = /(?:(?:今天|今晚|明天|刚才|待会|这两天|最近).{0,24}(?:一起|我们|咱们|看|吃|喝|聊|玩|等|追|做|发射|比赛|直播|电影|饭|饺子))|(?:(?:一起|我们|咱们).{0,18}(?:看|吃|喝|聊|玩|等|追|做|去|守着|等着))/u
 const CONTINUATION_CUE = /刚才|刚刚|上一(?:轮|个对话|个会话)|前面|之前说的|我们聊到|还没说完|(?:接着|继续)(?:说|聊|吧|下去|就|做)|上(?:回|次)(?:那|的)|那个|那样|那份|那套|这种|这样|一样|照旧|原样|照原来|老样子/u
 const SHORT_CONTINUATION = /^(?:嗯|好|那|就|还|用|按|还是|再来|继续|老规矩|照旧|原样|照原来|老样子|不改了|不换了|那样|这样|那份|那套|那个|刚(?:才|刚)(?:说的)?|也|来吧|行吗|可以吗|吗|吧|呢|[，、,.。！!？?\s])+$/u
 const OPEN_MEAL_QUERY = /^(?:现在|今天(?:晚上)?|今晚|中午|晚上|明天|早上|早餐|午餐|晚餐|夜宵)?[，、,\s]*(?:我们|咱们)?(?:想|要|该|可以|应该)?吃(?:点儿?|些)?什么(?:好|呢|呀|啊|吧|合适)?[。！!？?\s]*$/u
@@ -385,6 +388,9 @@ function classify(text, speaker) {
   if (speaker === 'user' && MEMORY_META_QUERY.test(value)) return null
   if (/[?？]\s*$/u.test(value) || /^(你还记得|你记得|是什么|是否|能不能|可以吗|为什么|什么时候|哪一个|哪些)/u.test(value.trim())) return null
   if (speaker === 'assistant' && isAssistantAcknowledgement(value)) return null
+  if (speaker === 'user'
+    && DAILY_EVENT.test(value)
+    && !/(请记得|请记住|记得|别忘|答应|承诺|提醒)/u.test(value)) return 'event'
   if (speaker === 'assistant' && /(我会|我答应|下次我|我会把)/u.test(value)) return 'commitment'
   if (speaker === 'assistant') return null
   if (speaker === 'user' && /(答应|承诺|请记得|别忘|下次|要不要提醒|回来告诉|我会|我准备|计划|今晚会|明天要)/u.test(value)) return 'commitment'
@@ -434,6 +440,33 @@ function importance(kind, text) {
   return clamp(value)
 }
 
+function isDailyMemory(kind, text) {
+  return kind === 'event' && DAILY_EVENT.test(String(text))
+}
+
+function dailyExpiresAt(occurredAt) {
+  const value = new Date(occurredAt)
+  if (Number.isNaN(value.getTime())) return null
+  value.setUTCDate(value.getUTCDate() + DAILY_MEMORY_RETENTION_DAYS)
+  return value.toISOString()
+}
+
+function shouldPromoteDaily(memory, candidate) {
+  if (memory.retentionClass !== 'daily') return false
+  if (candidate.retentionClass !== 'daily') return true
+  const sessions = new Set([
+    ...(memory.supportSessionIds || []),
+    memory.sourceSessionId,
+    candidate.sourceSessionId,
+  ].filter(Boolean))
+  const dates = new Set([
+    ...(memory.supportDates || []),
+    dayKey(memory.occurredAt),
+    dayKey(candidate.occurredAt),
+  ].filter(Boolean))
+  return sessions.size >= 2 || (dates.size >= 2 && Number(memory.reinforcementCount || 0) >= 2)
+}
+
 function strength(memory, at) {
   const seen = new Date(memory.lastReinforcedAt || memory.lastSupportedAt || memory.lastSeenAt || memory.occurredAt).getTime()
   const ageHours = Math.max(0, (new Date(at).getTime() - seen) / 3600000)
@@ -441,14 +474,18 @@ function strength(memory, at) {
   const confirmedRecalls = Number(memory.confirmedRecallCount ?? memory.recallCount ?? 0)
   const rehearsals = confirmedRecalls + Number(memory.reinforcementCount || 0)
   const boost = Math.min(0.35, Math.log2(rehearsals + 1) * 0.08)
-  const halfLife = HALF_LIFE_HOURS[memory.kind] ?? HALF_LIFE_HOURS.fact
+  const halfLife = memory.retentionClass === 'daily'
+    ? DAILY_MEMORY_HALF_LIFE_HOURS
+    : HALF_LIFE_HOURS[memory.kind] ?? HALF_LIFE_HOURS.fact
   return clamp((base + boost) * Math.pow(0.5, ageHours / halfLife))
 }
 
 function freshness(memory, at) {
   const seen = new Date(memory.lastReinforcedAt || memory.lastSupportedAt || memory.lastSeenAt || memory.occurredAt || memory.recordedAt).getTime()
   const ageHours = Math.max(0, (new Date(at).getTime() - seen) / 3600000)
-  const halfLife = HALF_LIFE_HOURS[memory.kind] ?? HALF_LIFE_HOURS.fact
+  const halfLife = memory.retentionClass === 'daily'
+    ? DAILY_MEMORY_HALF_LIFE_HOURS
+    : HALF_LIFE_HOURS[memory.kind] ?? HALF_LIFE_HOURS.fact
   return clamp(Math.pow(0.5, ageHours / halfLife), 0.02, 1)
 }
 
@@ -461,6 +498,18 @@ function normalizeMemoryRow(row) {
   return {
     ...row,
     subcategory: row.subcategory || subcategoryFor(row.kind, `${row.summary || ''} ${row.evidence || ''}`),
+    retentionClass: row.retentionClass || 'durable',
+    dailyExpiresAt: row.dailyExpiresAt || null,
+    promotionScore: Number(row.promotionScore ?? (row.retentionClass === 'daily' ? 0.25 : 1)),
+    promotionState: row.promotionState || (row.retentionClass === 'daily' ? 'watching' : 'durable'),
+    supportSessionIds: [...new Set([
+      ...(Array.isArray(row.supportSessionIds) ? row.supportSessionIds : []),
+      row.sourceSessionId,
+    ].filter(Boolean))],
+    supportDates: [...new Set([
+      ...(Array.isArray(row.supportDates) ? row.supportDates : []),
+      row.occurredAt ? dayKey(row.occurredAt) : null,
+    ].filter(Boolean))],
     occurredAt: row.occurredAt || recordedAt,
     recordedAt,
     lastSeenAt: row.lastSeenAt || row.occurredAt || recordedAt,
@@ -765,6 +814,12 @@ class MemoryEngine {
       lastRecalledAt: null,
       importance: score,
       strength: score,
+      retentionClass: isDailyMemory(kind, value) ? 'daily' : 'durable',
+      dailyExpiresAt: isDailyMemory(kind, value) ? dailyExpiresAt(occurredAt) : null,
+      promotionScore: isDailyMemory(kind, value) ? 0.25 : 1,
+      promotionState: isDailyMemory(kind, value) ? 'watching' : 'durable',
+      supportSessionIds: [sessionId],
+      supportDates: [dayKey(occurredAt)],
       recallCount: 0,
       confirmedRecallCount: 0,
       reinforcementCount: 0,
@@ -830,11 +885,44 @@ class MemoryEngine {
       .sort((a, b) => String(b.lastSeenAt).localeCompare(String(a.lastSeenAt)))[0]
     if (existing) {
       if (normalize(existing.summary) === normalize(candidate.summary)) {
+        const sourceTurnIds = new Set(existing.sourceTurnIds || [])
+        const newEvidence = (candidate.sourceTurnIds || []).some((turnId) => !sourceTurnIds.has(turnId))
         existing.lastSeenAt = candidate.lastSeenAt
         existing.freshness = 1
         existing.evidence = candidate.evidence
         existing.sourceTurnIds = [...new Set([...(existing.sourceTurnIds || []), ...(candidate.sourceTurnIds || [])])]
-        existing.reinforcementCount = Number(existing.reinforcementCount || 0) + 1
+        if (newEvidence) {
+          existing.reinforcementCount = Number(existing.reinforcementCount || 0) + 1
+          existing.supportSessionIds = [...new Set([
+            ...(existing.supportSessionIds || []),
+            existing.sourceSessionId,
+            candidate.sourceSessionId,
+          ].filter(Boolean))]
+          existing.supportDates = [...new Set([
+            ...(existing.supportDates || []),
+            dayKey(existing.occurredAt),
+            dayKey(candidate.occurredAt),
+          ].filter(Boolean))]
+          if (existing.retentionClass === 'daily') {
+            existing.promotionScore = clamp(
+              Number(existing.promotionScore || 0.25)
+                + (existing.supportSessionIds.length > 1 ? 0.4 : 0.2),
+            )
+          }
+        }
+        if (newEvidence && shouldPromoteDaily(existing, candidate)) {
+          existing.retentionClass = 'durable'
+          existing.dailyExpiresAt = null
+          existing.promotionState = 'promoted'
+          existing.promotedAt = now()
+          existing.promotionReason = candidate.retentionClass === 'daily'
+            ? 'cross-session-or-cross-day-rehearsal'
+            : 'later-durable-evidence'
+          existing.importance = Math.max(Number(existing.importance || 0), 0.72)
+          existing.strength = Math.max(Number(existing.strength || 0), existing.importance)
+          await this.saveMemory(existing, 'promote', { reason: existing.promotionReason })
+          return existing
+        }
         existing.recordedAt = existing.recordedAt || now()
         await this.saveMemory(existing, 'refresh', { source: candidate.source ?? null })
         return existing
@@ -925,6 +1013,9 @@ class MemoryEngine {
       .flatMap((row) => {
         const legacy = anchoredPuppetSource(row, legacyTurns)
         if (!candidateIsRecallable(row, legacy)) return []
+        if (row.retentionClass === 'daily'
+          && row.dailyExpiresAt
+          && new Date(row.dailyExpiresAt).getTime() <= new Date(at).getTime()) return []
         const text = `${row.summary} ${row.evidence}`
         const lexical = lexicalScore(direct, `${text} ${row.factKey}`)
         if (reference && !overlapCount(reference.words, focalWords(text))) return []
@@ -1201,7 +1292,9 @@ class MemoryEngine {
     for (const memory of this.memories.values()) {
       memory.freshness = freshness(memory, at)
       memory.effectiveStrength = strength(memory, at)
-      if (memory.status === 'active' && memory.effectiveStrength < FADED_MEMORY_STRENGTH) memory.status = 'faded'
+      if (memory.status === 'active'
+        && ((memory.dailyExpiresAt && new Date(memory.dailyExpiresAt).getTime() <= new Date(at).getTime())
+          || memory.effectiveStrength < FADED_MEMORY_STRENGTH)) memory.status = 'faded'
       if (memory.kind === 'commitment' && memory.status === 'open' && memory.dueAt && new Date(memory.dueAt) <= new Date(at)) memory.status = 'expired'
       await this.saveMemory(memory, 'consolidate')
     }
@@ -1319,6 +1412,12 @@ class MemoryEngine {
         lastRecalledAt: null,
         importance: clamp(raw.importance, 0.2, 1),
         strength: clamp(raw.importance, 0.2, 1),
+        retentionClass: isDailyMemory(effectiveKind, evidence) ? 'daily' : 'durable',
+        dailyExpiresAt: isDailyMemory(effectiveKind, evidence) ? dailyExpiresAt(occurredAt) : null,
+        promotionScore: isDailyMemory(effectiveKind, evidence) ? 0.25 : 1,
+        promotionState: isDailyMemory(effectiveKind, evidence) ? 'watching' : 'durable',
+        supportSessionIds: [sessionId],
+        supportDates: [dayKey(occurredAt)],
         recallCount: 0,
         confirmedRecallCount: 0,
         reinforcementCount: 0,
@@ -1631,7 +1730,7 @@ async function apply(ctx, config = {}) {
   ctx.systemPrompt.section({
     name: 'companion-memory-guidance',
     order: (ctx.systemPrompt.getSectionOrder('TOOLS_SDK') ?? 5000) + 10,
-    text: '伴生记忆已启用。插件会在每轮自动检索并注入相关记忆；普通连续性不需要重复调用 recall。只把自动注入或记忆工具返回的内容当作有来源参考；需要完整原话、确认、纠正或删除时再使用记忆工具。如果用户问以前是否提过某事，而没有相符的记忆或原话，请直接说目前无法确认，不要把推测当成回忆。遇到「还是那样」「上次那套」等指代，能从当前对话或相关记忆接上就自然接话；如果缺少具体线索且没有匹配的注入，先简短问用户指哪一件，不调用 recall 来盲找，不把相近偏好当成发生过的事。用户明确纠正、删除或要求忘记时，以最新要求为准。不要因为一次临时情绪或寒暄就扩大长期记忆。',
+    text: '伴生记忆已启用。插件会在每轮自动检索并注入相关记忆；普通连续性不需要重复调用 recall。只把自动注入或记忆工具返回的内容当作有来源参考；需要完整原话、确认、纠正或删除时再使用记忆工具。工具可用性以本回合工具清单和本回合调用结果为准；历史回合出现过的拒绝或白名单错误，不代表工具当前仍不可用。如果 companion_memory 在本回合工具清单中，遇到用户明确要求记住、纠正事实或补充重要细节时，应直接尝试调用；只有本次调用返回失败，才能说这次没有写入。只有本次工具调用返回成功写入回执（例如 stored=true 且带有记忆 ID），才能说内容已写入长期记忆；仅在聊天中回应或复述不等于持久化。如果用户问以前是否提过某事，而没有相符的记忆或原话，请直接说目前无法确认，不要把推测当成回忆。遇到「还是那样」「上次那套」等指代，能从当前对话或相关记忆接上就自然接话；如果缺少具体线索且没有匹配的注入，先简短问用户指哪一件，不调用 recall 来盲找，不把相近偏好当成发生过的事。用户明确纠正、删除或要求忘记时，以最新要求为准。不要因为一次临时情绪或寒暄就扩大长期记忆。',
   })
   ctx.systemPrompt.context({
     name: 'companion-memory-recall',

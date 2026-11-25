@@ -594,6 +594,55 @@ test('软每日配额抑制普通写入，但不阻断明确记住的高优先�
   assert.equal((await store.metricSummary()).suppressedWrites, 1)
 })
 
+test('日常共同事件会在跨会话重复后自动晋升，不需要用户手动整理', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'companion-memory-daily-promotion-'))
+  const store = await new ResearchStore(root).init({ test: true })
+  const memory = new CompanionMemory({ store })
+  const first = await memory.createSession({ title: 'daily-first' })
+  const firstTurn = await memory.ingestTurn({
+    sessionId: first.id,
+    speaker: 'user',
+    text: '今晚一起看神舟发射吧。',
+    turnIndex: 0,
+    occurredAt: '2026-11-22T10:00:00.000Z',
+  })
+  assert.equal(firstTurn.candidate.kind, 'event')
+  assert.equal(firstTurn.candidate.retentionClass, 'daily')
+  const second = await memory.createSession({ title: 'daily-second', parentSessionId: first.id })
+  const secondTurn = await memory.ingestTurn({
+    sessionId: second.id,
+    speaker: 'user',
+    text: '今晚一起看神舟发射吧。',
+    turnIndex: 0,
+    occurredAt: '2026-11-23T10:00:00.000Z',
+  })
+  assert.equal(secondTurn.memory.retentionClass, 'durable')
+  assert.equal(secondTurn.memory.promotionState, 'promoted')
+  assert.ok(store.memoryEvents.some((event) => event.type === 'promote'))
+})
+
+test('日常共同事件一周无人再提会自动淡出召回，但原始记录仍保留', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'companion-memory-daily-expiry-'))
+  const clock = new SimulatedClock('2026-11-22T10:00:00.000Z')
+  const store = await new ResearchStore(root).init({ test: true })
+  const memory = new CompanionMemory({ store, clock: () => clock.now() })
+  const session = await memory.createSession({ title: 'daily-expiry' })
+  const result = await memory.ingestTurn({
+    sessionId: session.id,
+    speaker: 'user',
+    text: '今晚一起看神舟发射吧。',
+    turnIndex: 0,
+    occurredAt: clock.iso(),
+  })
+  clock.advanceDays(8)
+  const hits = await memory.retrieve('神舟发射', { sessionId: session.id, now: clock.iso() })
+  assert.equal(hits.length, 0)
+  await memory.consolidate()
+  assert.equal(store.listMemories()[0].status, 'faded')
+  assert.equal(store.listTurns().length, 1)
+  assert.equal(result.candidate.retentionClass, 'daily')
+})
+
 test('低置信度历史查询才触发一次语义门控，并且只允许选择候选记忆', async () => {
   const root = await mkdtemp(join(tmpdir(), 'companion-memory-semantic-'))
   const store = await new ResearchStore(root).init({ test: true })
