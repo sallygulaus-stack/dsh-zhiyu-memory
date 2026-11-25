@@ -1,6 +1,6 @@
 {
   "name": "dsh-zhiyu-memory",
-  "version": "0.1.14",
+  "version": "0.1.15",
   "private": true,
   "type": "module",
   "description": "给 DeepSeek Harness 的长期记忆：每条都追得回原话，按类型自然淡化，可纠正、可分级删除。",

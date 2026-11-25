@@ -487,6 +487,67 @@ test('DSH bundle 过滤角色卡运行时注入，不写入回合或长期记忆
   assert.equal((await engine.stats()).filteredRuntimeInjections, 1)
 })
 
+test('DSH bundle 从运行时消息快照只写入用户本人消息并按消息 ID 去重', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'companion-plugin-runtime-snapshot-'))
+  const handlers = new Map()
+  const ctx = {
+    get: () => undefined,
+    inject: () => {},
+    on: (name, handler) => {
+      handlers.set(name, handler)
+      return () => handlers.delete(name)
+    },
+    tools: { register: () => {} },
+    systemPrompt: {
+      section: () => {},
+      context: () => {},
+      getSectionOrder: () => 5000,
+      getContextOrder: () => 200,
+    },
+  }
+  const dispose = await apply(ctx, { root })
+  const session = {
+    id: 'snapshot-session',
+    header: {},
+    snapshotEvents: () => [],
+    seq: 0,
+  }
+  const prompt = [
+    '【当前时间】2026/11/25 00:02:11（Asia/Shanghai）',
+    '【当前角色】女儿（完整角色卡请调用 qq_get_prompt 查看）',
+    '【会话令牌】token-for-this-turn',
+    '【当前唤醒】private:909227066',
+    '【行动前】先判断当前消息是否需要回复。',
+    `【本次消息快照】${JSON.stringify({ messages: [
+      { messageId: '41', sender: '私聊', isOwner: false, text: '旁人发言不应写入。' },
+      { messageId: '42', sender: '私聊', isOwner: true, text: '今晚一起看神舟发射吧。' },
+    ] })}`,
+    '【快照之后的运行时附注】不应进入记忆。',
+  ].join('\n')
+  let envelopeId = 0
+  const invoke = () => handlers.get('agent/pre-step')({
+    agent: { session },
+    messages: [{
+      id: `runtime-envelope-${++envelopeId}`,
+      content: [{ type: 'text', text: prompt }],
+      source: { kind: 'user' },
+    }],
+  }, async () => 'continued')
+
+  assert.equal(await invoke(), 'continued')
+  assert.equal(await invoke(), 'continued')
+  dispose()
+
+  const restored = await new MemoryEngine(root, 6).init()
+  assert.equal(restored.turns.length, 1)
+  assert.equal(restored.turns[0].text, '今晚一起看神舟发射吧。')
+  assert.equal(restored.turns[0].sourceKey, 'snapshot:snapshot-session:42')
+  assert.equal(restored.list().length, 1)
+  assert.equal(restored.list()[0].retentionClass, 'daily')
+  assert.equal(restored.list()[0].summary, '今晚一起看神舟发射吧。')
+  assert.equal((await restored.stats()).filteredRuntimeInjections, 0)
+})
+
 test('DSH bundle 不会因用户正常提到当前时间而误过滤', async () => {
   const root = await mkdtemp(join(tmpdir(), 'companion-plugin-runtime-text-'))
   const engine = await new MemoryEngine(root, 6).init()

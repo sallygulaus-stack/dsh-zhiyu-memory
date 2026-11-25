@@ -413,6 +413,58 @@ function isRuntimeInjection(text, speaker, forcedKind = null) {
   return header && RUNTIME_INJECTION_MARKERS.some((pattern) => pattern.test(value))
 }
 
+function runtimeSnapshotMessages(text, speaker = 'user') {
+  if (!isRuntimeInjection(text, speaker)) return null
+  const value = String(text || '')
+  const marker = '【本次消息快照】'
+  const markerIndex = value.indexOf(marker)
+  if (markerIndex < 0) return []
+  const start = value.indexOf('{', markerIndex + marker.length)
+  if (start < 0) return []
+
+  let depth = 0
+  let quoted = false
+  let escaped = false
+  let end = -1
+  for (let index = start; index < value.length; index += 1) {
+    const char = value[index]
+    if (quoted) {
+      if (escaped) escaped = false
+      else if (char === '\\') escaped = true
+      else if (char === '"') quoted = false
+      continue
+    }
+    if (char === '"') quoted = true
+    else if (char === '{') depth += 1
+    else if (char === '}') {
+      depth -= 1
+      if (depth === 0) {
+        end = index + 1
+        break
+      }
+    }
+  }
+  if (end < 0) return []
+
+  try {
+    const snapshot = JSON.parse(value.slice(start, end))
+    if (!Array.isArray(snapshot.messages)) return []
+    return snapshot.messages
+      .filter((message) => (
+        message?.isOwner === true
+        && message.messageId != null
+        && typeof message.text === 'string'
+        && message.text.trim()
+      ))
+      .map((message) => ({
+        messageId: String(message.messageId),
+        text: message.text.trim(),
+      }))
+  } catch {
+    return []
+  }
+}
+
 function isAssistantAcknowledgement(text) {
   const value = String(text || '').trim()
   return /(?:好的?[，, ]*)?(?:收到|明白|了解|我)?(?:已经|已)?(?:记住了|记下了|记录好了|存好了)/u.test(value)
@@ -1818,17 +1870,34 @@ async function apply(ctx, config = {}) {
     const sessionId = session?.id || agent?.id || 'unknown'
     const parentSessionId = session?.header?.parentSession || null
     const userMessages = messages.filter((item) => item?.source?.kind === 'user')
-    const query = userMessages.map(messageText).filter(Boolean).join('\n').trim()
+    const queryParts = []
     for (const item of userMessages) {
       const text = messageText(item)
-      if (text) await engine.ingest({
+      if (!text) continue
+      const snapshot = runtimeSnapshotMessages(text)
+      if (snapshot) {
+        for (const message of snapshot) {
+          await engine.ingest({
+            sessionId,
+            parentSessionId,
+            speaker: 'user',
+            text: message.text,
+            sourceKey: `snapshot:${sessionId}:${message.messageId}`,
+          })
+          queryParts.push(message.text)
+        }
+        continue
+      }
+      await engine.ingest({
         sessionId,
         parentSessionId,
         speaker: 'user',
         text,
         sourceKey: `user:${sessionId}:${item.id}`,
       })
+      queryParts.push(text)
     }
+    const query = queryParts.at(-1) || ''
     latestQuery.set(sessionId, {
       query,
       context: query ? await engine.context(sessionId, query) : '',
