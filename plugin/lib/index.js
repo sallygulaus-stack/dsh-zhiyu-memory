@@ -804,6 +804,7 @@ class MemoryEngine {
     occurredAt = now(),
     writePriority = null,
     forcedKind = null,
+    writeMode = 'manual',
   }) {
     const value = String(text ?? '').trim()
     if (!value || (sourceKey && this.seenSources.has(sourceKey))) return { stored: false, reason: 'duplicate-or-empty' }
@@ -843,6 +844,8 @@ class MemoryEngine {
       ? forcedKind
       : classify(value, speaker)
     if (!kind) return { stored: true, candidate: null, turn }
+    const automatic = writeMode === 'auto'
+    const daily = automatic || isDailyMemory(kind, value)
     const score = importance(kind, value)
     const candidate = {
       id: `memory_${randomUUID().replaceAll('-', '')}`,
@@ -866,10 +869,10 @@ class MemoryEngine {
       lastRecalledAt: null,
       importance: score,
       strength: score,
-      retentionClass: isDailyMemory(kind, value) ? 'daily' : 'durable',
-      dailyExpiresAt: isDailyMemory(kind, value) ? dailyExpiresAt(occurredAt) : null,
-      promotionScore: isDailyMemory(kind, value) ? 0.25 : 1,
-      promotionState: isDailyMemory(kind, value) ? 'watching' : 'durable',
+      retentionClass: daily ? 'daily' : 'durable',
+      dailyExpiresAt: daily ? dailyExpiresAt(occurredAt) : null,
+      promotionScore: daily ? 0.25 : 1,
+      promotionState: daily ? 'watching' : 'durable',
       supportSessionIds: [sessionId],
       supportDates: [dayKey(occurredAt)],
       recallCount: 0,
@@ -887,7 +890,8 @@ class MemoryEngine {
       factKey: keyFor(kind, value),
       source: sourceKey ?? turn.id,
       writePolicy: 'local-signal',
-      writePriority: writePriority || (['commitment', 'relationship'].includes(kind) ? 'priority' : 'normal'),
+      writeMode: automatic ? 'auto' : 'manual',
+      writePriority: writePriority || (automatic ? 'normal' : (['commitment', 'relationship'].includes(kind) ? 'priority' : 'normal')),
     }
     const semantic = semanticState(value)
     const ref = evidenceRef(turn, value)
@@ -962,7 +966,7 @@ class MemoryEngine {
             )
           }
         }
-        if (newEvidence && shouldPromoteDaily(existing, candidate)) {
+        if (candidate.writeMode !== 'auto' && newEvidence && shouldPromoteDaily(existing, candidate)) {
           existing.retentionClass = 'durable'
           existing.dailyExpiresAt = null
           existing.promotionState = 'promoted'
@@ -1464,10 +1468,10 @@ class MemoryEngine {
         lastRecalledAt: null,
         importance: clamp(raw.importance, 0.2, 1),
         strength: clamp(raw.importance, 0.2, 1),
-        retentionClass: isDailyMemory(effectiveKind, evidence) ? 'daily' : 'durable',
-        dailyExpiresAt: isDailyMemory(effectiveKind, evidence) ? dailyExpiresAt(occurredAt) : null,
-        promotionScore: isDailyMemory(effectiveKind, evidence) ? 0.25 : 1,
-        promotionState: isDailyMemory(effectiveKind, evidence) ? 'watching' : 'durable',
+        retentionClass: 'daily',
+        dailyExpiresAt: dailyExpiresAt(occurredAt),
+        promotionScore: 0.25,
+        promotionState: 'watching',
         supportSessionIds: [sessionId],
         supportDates: [dayKey(occurredAt)],
         recallCount: 0,
@@ -1493,7 +1497,8 @@ class MemoryEngine {
         evidenceRefs: [ref],
         source: sourceIds.join(','),
         writePolicy: 'llm-evidence-grounded',
-        writePriority: ['commitment', 'relationship'].includes(effectiveKind) ? 'priority' : 'normal',
+        writeMode: 'auto',
+        writePriority: 'normal',
       }
       if (candidate.visibility === 'evidence-only') candidate.status = 'review'
       const saved = await this.remember(candidate)
@@ -1827,6 +1832,7 @@ async function apply(ctx, config = {}) {
         sourceKey: `tool:${sessionId}:${Date.now()}`,
         writePriority: 'priority',
         forcedKind: args.kind || 'fact',
+        writeMode: 'manual',
       })
       if (args.action === 'recall') {
         return { hits: compactRecallHits(await engine.recall(asText(args.query || args.text), sessionId)) }
@@ -1883,6 +1889,7 @@ async function apply(ctx, config = {}) {
             speaker: 'user',
             text: message.text,
             sourceKey: `snapshot:${sessionId}:${message.messageId}`,
+            writeMode: 'auto',
           })
           queryParts.push(message.text)
         }
@@ -1894,6 +1901,7 @@ async function apply(ctx, config = {}) {
         speaker: 'user',
         text,
         sourceKey: `user:${sessionId}:${item.id}`,
+        writeMode: 'auto',
       })
       queryParts.push(text)
     }
@@ -1920,6 +1928,7 @@ async function apply(ctx, config = {}) {
         speaker: 'assistant',
         text,
         sourceKey,
+        writeMode: 'auto',
       }) : null
       if (!text || saved?.stored) await engine.recordUsage(event.data?.usage, sourceKey)
     }

@@ -463,6 +463,41 @@ test('DSH bundle 的明确 remember 请求强制写入事实', async () => {
   assert.equal(engine.list().length, 1)
 })
 
+test('DSH bundle 自动录入只进入日常层，事实层必须显式 remember', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'companion-plugin-auto-daily-only-'))
+  const engine = await new MemoryEngine(root, 6).init()
+  const automatic = await engine.ingest({
+    sessionId: 'auto-1',
+    speaker: 'user',
+    text: '现在服务器上正在施工，姐姐在看日志。',
+    sourceKey: 'snapshot:auto-1',
+    writeMode: 'auto',
+  })
+  assert.equal(automatic.memory.kind, 'fact')
+  assert.equal(automatic.memory.retentionClass, 'daily')
+  assert.equal(automatic.memory.writeMode, 'auto')
+  const repeated = await engine.ingest({
+    sessionId: 'auto-2',
+    speaker: 'user',
+    text: '现在服务器上正在施工，姐姐在看日志。',
+    sourceKey: 'snapshot:auto-2',
+    writeMode: 'auto',
+  })
+  assert.equal(repeated.memory.retentionClass, 'daily')
+  assert.notEqual(repeated.memory.promotionState, 'promoted')
+  const manual = await engine.ingest({
+    sessionId: 'manual-1',
+    speaker: 'user',
+    text: '服务器长期部署在上海云端。',
+    sourceKey: 'tool:manual-1',
+    forcedKind: 'fact',
+    writePriority: 'priority',
+    writeMode: 'manual',
+  })
+  assert.equal(manual.memory.retentionClass, 'durable')
+  assert.equal(manual.memory.writeMode, 'manual')
+})
+
 test('DSH bundle 过滤角色卡运行时注入，不写入回合或长期记忆', async () => {
   const root = await mkdtemp(join(tmpdir(), 'companion-plugin-runtime-filter-'))
   const engine = await new MemoryEngine(root, 6).init()
