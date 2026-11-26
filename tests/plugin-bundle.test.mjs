@@ -1,6 +1,6 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
-import { mkdtemp, writeFile } from 'node:fs/promises'
+import { mkdtemp, readFile, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { apply, MemoryEngine, compactRecallHits, freshness, strength } from '../plugin/lib/index.js'
@@ -660,8 +660,73 @@ test('DSH bundle 的 recall 工具只回传必要来源字段', () => {
     },
   }])
   assert.equal(hits[0].memory.sourceTurnIds[0], 't1')
+  assert.equal(hits[0].memory.factKey, null)
+  assert.equal(hits[0].memory.epistemicStatus, null)
+  assert.equal(hits[0].memory.lastRecalledAt, null)
   assert.equal(hits[0].memory.sourceFile, undefined)
   assert.equal(hits[0].memory.sourceRowHash, undefined)
+})
+
+test('DSH bundle 的 recall 工具可无损返回混合新旧记忆，不改写记忆文件', async (t) => {
+  const root = await mkdtemp(join(tmpdir(), 'companion-tool-recall-json-'))
+  const at = new Date().toISOString()
+  const memoryFile = join(root, 'memories.json')
+  const summary = '蓝色工具箱原来放在仓库门口。'
+  await writeFile(memoryFile, JSON.stringify([{
+    id: 'legacy',
+    kind: 'event',
+    speaker: 'user',
+    sourceKind: 'puppet-memory',
+    migrationStatus: 'human-reviewed',
+    summary,
+    evidence: summary,
+    sourceTurnIds: ['legacy-turn'],
+    sourceSessionId: 'legacy-session',
+    occurredAt: at,
+    recordedAt: at,
+    visibility: 'recallable',
+    epistemicStatus: 'accepted',
+    status: 'active',
+    importance: 0.8,
+    strength: 0.8,
+  }]))
+  let tool
+  const dispose = await apply({
+    get: () => undefined,
+    inject: () => {},
+    on: () => () => {},
+    tools: { register: (definition) => { tool = definition } },
+    systemPrompt: {
+      section: () => {},
+      context: () => {},
+      getSectionOrder: () => 5000,
+      getContextOrder: () => 200,
+    },
+  }, { root })
+  t.after(dispose)
+
+  const remembered = await tool.execute({
+    action: 'remember',
+    text: '蓝色工具箱现在放在仓库货架。',
+    kind: 'fact',
+    sessionId: 'current-session',
+  })
+  assert.equal(remembered.stored, true)
+  assert.equal(typeof remembered.memory.claimType, 'string')
+  const before = await readFile(memoryFile, 'utf8')
+  assert.equal(Object.hasOwn(JSON.parse(before).find((row) => row.id === 'legacy'), 'claimType'), false)
+
+  const result = await tool.execute({ action: 'recall', query: '蓝色工具箱', sessionId: 'new-session' })
+  assert.equal(result.hits.length, 2)
+  assert.deepEqual(result, JSON.parse(JSON.stringify(result)))
+  const legacy = result.hits.find((hit) => hit.memory.id === 'legacy').memory
+  const current = result.hits.find((hit) => hit.memory.id === remembered.memory.id).memory
+  assert.equal(legacy.claimType, null)
+  assert.equal(legacy.evidence, summary)
+  assert.equal(legacy.occurredAt, at)
+  assert.deepEqual(legacy.sourceTurnIds, ['legacy-turn'])
+  assert.equal(current.claimType, remembered.memory.claimType)
+  assert.equal(await readFile(memoryFile, 'utf8'), before)
 })
 
 test('DSH bundle 低频整理拒绝无证据候选并记录成本指标', async () => {

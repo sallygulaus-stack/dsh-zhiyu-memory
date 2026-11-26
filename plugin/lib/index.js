@@ -1651,26 +1651,15 @@ function asText(value) {
   return typeof value === 'string' ? value : JSON.stringify(value ?? '')
 }
 
+const RECALL_MEMORY_FIELDS = [
+  'id', 'kind', 'subcategory', 'recordType', 'subjectType', 'summary', 'evidence',
+  'sourceTurnIds', 'sourceSessionId', 'occurredAt', 'recordedAt', 'lastRecalledAt',
+  'factKey', 'claimType', 'epistemicStatus', 'status', 'writePriority',
+]
+
 function compactMemory(memory) {
-  return {
-    id: memory.id,
-    kind: memory.kind,
-    subcategory: memory.subcategory,
-    recordType: memory.recordType,
-    subjectType: memory.subjectType,
-    summary: memory.summary,
-    evidence: memory.evidence,
-    sourceTurnIds: memory.sourceTurnIds,
-    sourceSessionId: memory.sourceSessionId,
-    occurredAt: memory.occurredAt,
-    recordedAt: memory.recordedAt,
-    lastRecalledAt: memory.lastRecalledAt,
-    factKey: memory.factKey,
-    claimType: memory.claimType,
-    epistemicStatus: memory.epistemicStatus,
-    status: memory.status,
-    writePriority: memory.writePriority,
-  }
+  // Older rows may lack fields; keep the tool output lossless without changing the stored row.
+  return Object.fromEntries(RECALL_MEMORY_FIELDS.map((field) => [field, memory[field] ?? null]))
 }
 
 function compactRecallHits(hits) {
