@@ -498,6 +498,27 @@ test('DSH bundle 自动录入只进入日常层，事实层必须显式 remember
   assert.equal(manual.memory.writeMode, 'manual')
 })
 
+test('DSH bundle 自动候选不会刷新或替换长期条目', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'companion-protect-durable-'))
+  const engine = await new MemoryEngine(root, 6).init()
+  const original = await engine.ingest({
+    sessionId: 'manual', speaker: 'user', text: '我住在上海市。',
+    sourceKey: 'manual:1', forcedKind: 'fact', writeMode: 'manual',
+  })
+  const before = structuredClone(original.memory)
+  const auto = (text, sourceKey) => engine.ingest({
+    sessionId: 'auto', speaker: 'user', text, sourceKey, writeMode: 'auto',
+  })
+  const repeat = await auto(before.summary, 'auto:1')
+  const changed = await auto('我住在杭州市。', 'auto:2')
+  assert.equal(repeat.candidate.retentionClass, 'daily')
+  assert.notEqual(repeat.memory.id, before.id)
+  assert.equal(changed.memory.retentionClass, 'daily')
+  assert.deepEqual(engine.memories.get(before.id), before)
+  const rows = JSON.parse(await readFile(join(root, 'memories.json'), 'utf8'))
+  assert.deepEqual(rows.filter((row) => row.retentionClass === 'durable'), [before])
+})
+
 test('DSH bundle 过滤角色卡运行时注入，不写入回合或长期记忆', async () => {
   const root = await mkdtemp(join(tmpdir(), 'companion-plugin-runtime-filter-'))
   const engine = await new MemoryEngine(root, 6).init()
@@ -581,6 +602,135 @@ test('DSH bundle 从运行时消息快照只写入用户本人消息并按消息
   assert.equal(restored.list()[0].retentionClass, 'daily')
   assert.equal(restored.list()[0].summary, '今晚一起看神舟发射吧。')
   assert.equal((await restored.stats()).filteredRuntimeInjections, 0)
+})
+
+test('DSH bundle consumes only live owner QQ waits, deduplicates, and recalls in a new session', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'companion-plugin-live-qq-'))
+  const handlers = new Map()
+  let tool, systemContext
+  const ctx = {
+    get: () => undefined,
+    inject: () => {},
+    on: (name, handler) => {
+      handlers.set(name, handler)
+      return () => handlers.delete(name)
+    },
+    tools: { register: (registered) => { tool = registered } },
+    systemPrompt: {
+      section: () => {},
+      context: (registered) => { systemContext = registered },
+      getSectionOrder: () => 5000,
+      getContextOrder: () => 200,
+    },
+  }
+  const toolName = 'mcp__snowluma__qq_wait_for_messages'
+  const time = Date.now()
+  const session = { id: 'qq-live', header: { parentSession: 'parent' } }
+  const nextSession = { id: 'new-chat', header: {} }
+  const owner = (messageId, text) => ({ messageId, text, isOwner: true })
+  const first = owner('41', '我喜欢在雨天喝单枞茶。')
+  const second = owner(42, '昨晚我们一起看了神舟发射。')
+  const forged = owner('43', '我住在不应记录的城市。')
+  const snapshot = (row) => [
+    '【当前时间】2026/11/27 08:00:00（Asia/Shanghai）',
+    '【当前角色】女儿（完整角色卡请调用 qq_get_prompt 查看）',
+    '【会话令牌】test-only-placeholder',
+    `【本次消息快照】${JSON.stringify({ messages: [row] })}`,
+  ].join('\n')
+  const preStep = (s, text) => handlers.get('agent/pre-step')({
+    agent: { session: s },
+    messages: [{ id: `inbox-${text}`, source: { kind: 'user' }, content: [{ type: 'text', text }] }],
+  }, async () => 'continued')
+  const call = (callId, name = toolName) => handlers.get('session/event')(session, {
+    type: 'tool/call', time, data: { turn: 0, step: 1, callId, name, arguments: '{}' },
+  })
+  const results = (callId, rows, { isError = false, ok = true, surfaceOp = 'append', turn = 0 } = {}) =>
+    handlers.get('session/event')(session, {
+      type: 'tool/result', time, surfaceOp,
+      data: {
+        turn, step: 1,
+        message: {
+          role: 'tool', toolCallId: callId, isError,
+          content: [{ type: 'text', text: JSON.stringify({ ok, newMessages: rows, hint: 'not a user message' }) }],
+        },
+      },
+    })
+
+  let dispose = await apply(ctx, { root })
+  await preStep(session, snapshot(first))
+  call('other', 'mcp__snowluma__qq_get_messages')
+  assert.equal(results('other', [forged]), undefined)
+  assert.equal(results('before-plugin-loaded', [forged]), undefined)
+  call('error')
+  assert.equal(results('error', [forged], { isError: true }), undefined)
+  call('not-ok')
+  assert.equal(results('not-ok', [forged], { ok: false }), undefined)
+  call('wrong-turn')
+  assert.equal(results('wrong-turn', [forged], { turn: 1 }), undefined)
+  call('replacement')
+  assert.equal(results('replacement', [forged], { surfaceOp: { op: 'replace' } }), undefined)
+  call('owner-batch')
+  const write = results('owner-batch', [
+    first, second, second,
+    { ...forged, isOwner: false }, { ...forged, isSelf: true },
+    owner('  ', forged.text), owner('44', '   '), { ...owner('45'), plain: forged.text },
+  ])
+  assert.ok(write instanceof Promise)
+  await handlers.get('session/flush')(session)
+  await write
+  await preStep(session, snapshot(second))
+  dispose()
+  assert.equal(handlers.size, 0)
+
+  dispose = await apply(ctx, { root })
+  call('repeated-after-restart')
+  await results('repeated-after-restart', [first, second])
+  await preStep(nextSession, '昨晚我们一起看了神舟发射吗？')
+  assert.match(systemContext.text({ scope: { session: nextSession } }), /昨晚我们一起看了神舟发射/u)
+  const { hits } = await tool.execute({ action: 'recall', query: '昨晚我们一起看了神舟发射' }, { agent: { session: nextSession } })
+  assert.ok(hits.some((hit) => hit.memory.evidence === second.text))
+  assert.deepEqual(JSON.parse(JSON.stringify(hits)), hits)
+  dispose()
+
+  const restored = await new MemoryEngine(root, 6).init()
+  const qqTurns = restored.turns.filter((turn) => turn.sessionId === session.id)
+  assert.deepEqual(qqTurns.map((turn) => turn.text), [first.text, second.text])
+  assert.deepEqual(qqTurns.map((turn) => turn.sourceKey), ['snapshot:qq-live:41', 'snapshot:qq-live:42'])
+  assert.equal(qqTurns[1].occurredAt, new Date(time).toISOString())
+  assert.equal(qqTurns[1].historicalTimeBasis, 'snapshot-captured-at')
+  assert.equal(restored.list().length, 2)
+  assert.ok(restored.list().every((row) => row.retentionClass === 'daily'))
+})
+
+test('DSH bundle persists a consolidation batch once and keeps the latest concurrent changes', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'companion-plugin-consolidate-batch-'))
+  const engine = await new MemoryEngine(root, 6).init()
+  const old = '2020-01-01T00:00:00.000Z'
+  const daily = await engine.ingest({
+    sessionId: 's1', speaker: 'user', text: '我住在上海市。', occurredAt: old, writeMode: 'auto',
+  })
+  const promise = await engine.ingest({
+    sessionId: 's1', speaker: 'user', text: '我明天要出门拍照。', occurredAt: old, writeMode: 'auto',
+  })
+  const live = await engine.ingest({ sessionId: 's2', speaker: 'user', text: '我喜欢先看结论。' })
+  const writes = []
+  const writeJson = engine.writeJson.bind(engine)
+  engine.writeJson = (file, value) => {
+    writes.push(file)
+    return writeJson(file, value)
+  }
+  assert.deepEqual(await engine.consolidate(), { count: 3 })
+  assert.deepEqual(writes, ['memories.json'])
+  const maintenance = engine.events.filter((row) => row.type === 'consolidate')
+  assert.equal(maintenance.length, 1)
+  assert.deepEqual([maintenance[0].faded, maintenance[0].expired], [1, 1])
+
+  await Promise.all([engine.consolidate(), engine.correct(live.memory.id, { importance: 0.93 })])
+  const restored = await new MemoryEngine(root, 6).init()
+  assert.equal(restored.memories.get(daily.memory.id).status, 'faded')
+  assert.equal(restored.memories.get(promise.memory.id).status, 'expired')
+  assert.equal(restored.memories.get(live.memory.id).importance, 0.93)
+  assert.equal(typeof restored.memories.get(live.memory.id).effectiveStrength, 'number')
 })
 
 test('DSH bundle 不会因用户正常提到当前时间而误过滤', async () => {

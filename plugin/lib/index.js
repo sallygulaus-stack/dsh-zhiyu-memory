@@ -7,6 +7,7 @@ import { calculateDeepSeekCost } from './pricing.js'
 
 const name = 'companion-memory'
 const inject = ['tools', 'systemPrompt', 'llm']
+const QQ_WAIT_TOOL = 'mcp__snowluma__qq_wait_for_messages'
 const LOW_VALUE = /^(你好|嗨|哈[哈呵]+|嗯+|哦+|好的?|好呀|收到|谢谢|谢了|晚安|早安|ok|okay)$/iu
 const MEMORY_META_QUERY = /(你还记得|你记得|记忆里|长期偏好|有什么.*偏好|只根据已有记忆|只根据.*记忆|不要猜|新开.*聊天|翻阅.*记忆|记忆插件|companion_memory|使用.*(记忆|recall|remember|consolidate)|测试数据|不要编造)/iu
 const HALF_LIFE_HOURS = {
@@ -413,6 +414,30 @@ function isRuntimeInjection(text, speaker, forcedKind = null) {
   return header && RUNTIME_INJECTION_MARKERS.some((pattern) => pattern.test(value))
 }
 
+function ownerQqMessages(messages) {
+  if (!Array.isArray(messages)) return []
+  return messages.flatMap((message) => {
+    if (message?.isOwner !== true || message.isSelf === true) return []
+    const id = message.messageId
+    const messageId = (typeof id === 'string' || Number.isSafeInteger(id)) ? String(id).trim() : ''
+    const text = typeof message.text === 'string' ? message.text.trim() : ''
+    return messageId && text ? [{ messageId, text }] : []
+  })
+}
+
+function qqWaitResultMessages(message) {
+  if (message?.role !== 'tool' || message.isError === true
+    || !Array.isArray(message.content) || message.content.length !== 1) return []
+  const [part] = message.content
+  if (part?.type !== 'text' || typeof part.text !== 'string') return []
+  try {
+    const result = JSON.parse(part.text)
+    return result?.ok === true ? ownerQqMessages(result.newMessages) : []
+  } catch {
+    return []
+  }
+}
+
 function runtimeSnapshotMessages(text, speaker = 'user') {
   if (!isRuntimeInjection(text, speaker)) return null
   const value = String(text || '')
@@ -447,19 +472,7 @@ function runtimeSnapshotMessages(text, speaker = 'user') {
   if (end < 0) return []
 
   try {
-    const snapshot = JSON.parse(value.slice(start, end))
-    if (!Array.isArray(snapshot.messages)) return []
-    return snapshot.messages
-      .filter((message) => (
-        message?.isOwner === true
-        && message.messageId != null
-        && typeof message.text === 'string'
-        && message.text.trim()
-      ))
-      .map((message) => ({
-        messageId: String(message.messageId),
-        text: message.text.trim(),
-      }))
+    return ownerQqMessages(JSON.parse(value.slice(start, end))?.messages)
   } catch {
     return []
   }
@@ -605,6 +618,7 @@ class MemoryEngine {
     this.memories = new Map()
     this.events = []
     this.seenSources = new Set()
+    this.jsonWrites = new Map()
     this.seenUsageSources = new Set()
     this.consolidationCursors = {}
     this.purgedTurnIds = new Set()
@@ -774,9 +788,19 @@ class MemoryEngine {
 
   async writeJson(file, value) {
     const target = join(this.root, file)
-    const temp = `${target}.${process.pid}.${Date.now()}.tmp`
-    await writeFile(temp, `${JSON.stringify(value, null, 2)}\n`, 'utf8')
-    await rename(temp, target)
+    const text = `${JSON.stringify(value, null, 2)}\n`
+    const previous = this.jsonWrites.get(file)
+    const pending = (previous?.catch(() => {}) ?? Promise.resolve()).then(async () => {
+      const temp = `${target}.${process.pid}.${randomUUID()}.tmp`
+      await writeFile(temp, text, 'utf8')
+      await rename(temp, target)
+    })
+    this.jsonWrites.set(file, pending)
+    try {
+      await pending
+    } finally {
+      if (this.jsonWrites.get(file) === pending) this.jsonWrites.delete(file)
+    }
   }
 
   async session(sessionId, parentSessionId = null) {
@@ -802,6 +826,7 @@ class MemoryEngine {
     text,
     sourceKey,
     occurredAt = now(),
+    historicalTimeBasis,
     writePriority = null,
     forcedKind = null,
     writeMode = 'manual',
@@ -827,6 +852,7 @@ class MemoryEngine {
       return { stored: false, filtered: true, reason: 'internal-runtime-injection' }
     }
     await this.session(sessionId, parentSessionId)
+    if (sourceKey && this.seenSources.has(sourceKey)) return { stored: false, reason: 'duplicate-or-empty' }
     const turn = {
       id: `turn_${randomUUID().replaceAll('-', '')}`,
       sessionId,
@@ -835,11 +861,17 @@ class MemoryEngine {
       sourceKey: sourceKey ?? null,
       contentHash: sha256(value),
       occurredAt,
+      ...(historicalTimeBasis ? { historicalTimeBasis } : {}),
       recordedAt: now(),
     }
-    this.turns.push(turn)
     if (sourceKey) this.seenSources.add(sourceKey)
-    await this.append('turns.jsonl', turn)
+    try {
+      await this.append('turns.jsonl', turn)
+    } catch (error) {
+      if (sourceKey) this.seenSources.delete(sourceKey)
+      throw error
+    }
+    this.turns.push(turn)
     const kind = ['fact', 'preference', 'relationship', 'emotion', 'commitment', 'event'].includes(forcedKind)
       ? forcedKind
       : classify(value, speaker)
@@ -862,6 +894,7 @@ class MemoryEngine {
       sourceKind: 'dsh-event',
       sandboxOwned: true,
       occurredAt,
+      ...(historicalTimeBasis ? { historicalTimeBasis } : {}),
       recordedAt: now(),
       lastSeenAt: occurredAt,
       lastSupportedAt: turn.recordedAt,
@@ -933,6 +966,7 @@ class MemoryEngine {
     if (candidate.status === 'review') return this.saveMemory(candidate, 'candidate-review')
     const existing = [...this.memories.values()]
       .filter((row) => !['superseded', 'deleted'].includes(row.status)
+        && (candidate.writeMode !== 'auto' || row.retentionClass === 'daily')
         && (row.kind === candidate.kind
           || (row.factKey && candidate.factKey && row.factKey === candidate.factKey))
         && row.speaker === candidate.speaker
@@ -1345,16 +1379,30 @@ class MemoryEngine {
 
   async consolidate() {
     const at = now()
+    const time = new Date(at).getTime()
+    const changes = { faded: 0, expired: 0 }
     for (const memory of this.memories.values()) {
       memory.freshness = freshness(memory, at)
       memory.effectiveStrength = strength(memory, at)
       if (memory.status === 'active'
-        && ((memory.dailyExpiresAt && new Date(memory.dailyExpiresAt).getTime() <= new Date(at).getTime())
-          || memory.effectiveStrength < FADED_MEMORY_STRENGTH)) memory.status = 'faded'
-      if (memory.kind === 'commitment' && memory.status === 'open' && memory.dueAt && new Date(memory.dueAt) <= new Date(at)) memory.status = 'expired'
-      await this.saveMemory(memory, 'consolidate')
+        && ((memory.dailyExpiresAt && new Date(memory.dailyExpiresAt).getTime() <= time)
+          || memory.effectiveStrength < FADED_MEMORY_STRENGTH)) {
+        memory.status = 'faded'
+        changes.faded++
+      }
+      if (memory.kind === 'commitment' && memory.status === 'open' && memory.dueAt && new Date(memory.dueAt).getTime() <= time) {
+        memory.status = 'expired'
+        changes.expired++
+      }
     }
-    return { count: this.memories.size }
+    const count = this.memories.size
+    if (count) {
+      await this.writeJson('memories.json', [...this.memories.values()])
+      const event = { at, type: 'consolidate', count, ...changes }
+      this.events.push(event)
+      await this.append('events.jsonl', event)
+    }
+    return { count }
   }
 
   async consolidateSession(sessionId, { maxChars = 10_000 } = {}) {
@@ -1428,7 +1476,8 @@ class MemoryEngine {
         rejected++
         continue
       }
-      const occurredAt = sources.map((turn) => turn.occurredAt || turn.createdAt).sort()[0]
+      const firstSource = sources.reduce((first, turn) => turn.occurredAt < first.occurredAt ? turn : first)
+      const occurredAt = firstSource.occurredAt
       const semantic = semanticState(evidence)
       const inferredKind = classify(evidence, speaker)
       const effectiveKind = speaker === 'user'
@@ -1461,6 +1510,7 @@ class MemoryEngine {
         sourceKind: 'consolidation',
         sandboxOwned: true,
         occurredAt,
+        ...(firstSource.historicalTimeBasis ? { historicalTimeBasis: firstSource.historicalTimeBasis } : {}),
         recordedAt: now(),
         lastSeenAt: occurredAt,
         lastSupportedAt: now(),
@@ -1608,17 +1658,23 @@ class MemoryEngine {
     }
     const recalls = this.events.filter((row) => row.type === 'recall')
     const autoInjects = this.events.filter((row) => row.type === 'auto-inject')
-    const categoryCounts = Object.fromEntries(Object.keys(CATEGORY_LABELS).map((kind) => [
-      kind,
-      [...this.memories.values()].filter((memory) => memory.kind === kind).length,
-    ]))
+    const categoryCounts = Object.fromEntries(Object.keys(CATEGORY_LABELS).map((kind) => [kind, 0]))
+    const durableCategoryCounts = { ...categoryCounts }
     const subcategoryCounts = {}
+    const durableSubcategoryCounts = {}
+    let dailyMemories = 0
+    let promotedMemories = 0
     for (const memory of this.memories.values()) {
       const key = `${memory.kind}:${memory.subcategory || subcategoryFor(memory.kind, `${memory.summary || ''} ${memory.evidence || ''}`)}`
+      if (Object.hasOwn(categoryCounts, memory.kind)) categoryCounts[memory.kind]++
       subcategoryCounts[key] = (subcategoryCounts[key] || 0) + 1
+      if (memory.retentionClass === 'durable') {
+        if (Object.hasOwn(durableCategoryCounts, memory.kind)) durableCategoryCounts[memory.kind]++
+        durableSubcategoryCounts[key] = (durableSubcategoryCounts[key] || 0) + 1
+      }
+      if (memory.retentionClass === 'daily') dailyMemories++
+      if (memory.promotionState === 'promoted') promotedMemories++
     }
-    const dailyMemories = [...this.memories.values()].filter((memory) => memory.retentionClass === 'daily').length
-    const promotedMemories = [...this.memories.values()].filter((memory) => memory.promotionState === 'promoted').length
     return {
       root: this.root,
       sessions: this.sessions.size,
@@ -1627,6 +1683,8 @@ class MemoryEngine {
       activeMemories: this.list().length,
       categoryCounts,
       subcategoryCounts,
+      durableCategoryCounts,
+      durableSubcategoryCounts,
       dailyMemories,
       promotedMemories,
       events: this.events.length,
@@ -1860,10 +1918,54 @@ async function apply(ctx, config = {}) {
     },
   })
 
+  const pendingQqCalls = new WeakMap()
+  const pendingQqWrites = new WeakMap()
+  const ingestQq = (sessionId, parentSessionId, message, occurredAt) => engine.ingest({
+    sessionId,
+    parentSessionId,
+    speaker: 'user',
+    text: message.text,
+    sourceKey: `snapshot:${sessionId}:${message.messageId}`,
+    occurredAt,
+    historicalTimeBasis: occurredAt ? 'snapshot-captured-at' : undefined,
+    writeMode: 'auto',
+  })
+  const disposeSessionEvent = ctx.on('session/event', (session, event) => {
+    const data = event.data
+    if (event.type === 'turn/end') {
+      pendingQqCalls.delete(session)
+      return
+    }
+    if (event.type === 'tool/call' && data.name === QQ_WAIT_TOOL) {
+      let calls = pendingQqCalls.get(session)
+      if (!calls) pendingQqCalls.set(session, calls = new Map())
+      calls.set(data.callId, { turn: data.turn, step: data.step })
+      return
+    }
+    if (event.type !== 'tool/result' || event.surfaceOp !== 'append') return
+    const calls = pendingQqCalls.get(session)
+    const callId = data.message?.toolCallId
+    const call = calls?.get(callId)
+    if (!call || call.turn !== data.turn || call.step !== data.step) return
+    calls.delete(callId)
+    const messages = qqWaitResultMessages(data.message)
+    if (!messages.length) return
+    const observedAt = new Date(event.time).toISOString()
+    const parentSessionId = session.header?.parentSession || null
+    const write = (pendingQqWrites.get(session) ?? Promise.resolve()).then(async () => {
+      for (const message of messages) await ingestQq(session.id, parentSessionId, message, observedAt)
+    })
+    // The host logs failures from the observer; checkpoints wait without failing the chat.
+    pendingQqWrites.set(session, write.catch(() => {}))
+    return write
+  })
+  const disposeSessionFlush = ctx.on('session/flush', (session) => pendingQqWrites.get(session))
+
   const disposePreStep = ctx.on('agent/pre-step', async ({ agent, messages }, next) => {
     const session = sessionFor({ agent })
     const sessionId = session?.id || agent?.id || 'unknown'
     const parentSessionId = session?.header?.parentSession || null
+    await pendingQqWrites.get(session)
     const userMessages = messages.filter((item) => item?.source?.kind === 'user')
     const queryParts = []
     for (const item of userMessages) {
@@ -1872,14 +1974,7 @@ async function apply(ctx, config = {}) {
       const snapshot = runtimeSnapshotMessages(text)
       if (snapshot) {
         for (const message of snapshot) {
-          await engine.ingest({
-            sessionId,
-            parentSessionId,
-            speaker: 'user',
-            text: message.text,
-            sourceKey: `snapshot:${sessionId}:${message.messageId}`,
-            writeMode: 'auto',
-          })
+          await ingestQq(sessionId, parentSessionId, message)
           queryParts.push(message.text)
         }
         continue
@@ -1906,6 +2001,7 @@ async function apply(ctx, config = {}) {
     const session = sessionFor({ agent })
     if (!session) return
     const sessionId = session.id
+    await pendingQqWrites.get(session)
     const lastSeq = assistantSeq.get(sessionId) ?? -1
     for (const event of session.snapshotEvents()) {
       if (event.seq <= lastSeq || event.type !== 'assistant/message') continue
@@ -1931,6 +2027,8 @@ async function apply(ctx, config = {}) {
 
   return () => {
     consoleDisposed?.()
+    disposeSessionEvent()
+    disposeSessionFlush()
     disposePreStep()
     disposeTurnStopping()
   }

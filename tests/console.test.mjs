@@ -3,6 +3,7 @@ import assert from 'node:assert/strict'
 import { mkdtemp } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
+import { runInNewContext } from 'node:vm'
 import { MemoryEngine } from '../plugin/lib/index.js'
 import { registerMemoryConsoleRoutes } from '../plugin/lib/console.js'
 
@@ -67,7 +68,7 @@ test('记忆观察面板注册网页和只读数据路由', async () => {
   assert.match(pageResponse.body, /来源与状态/u)
   assert.match(pageResponse.body, /自动注入命中/u)
   assert.match(pageResponse.body, /分类概览|事实|偏好/u)
-  assert.match(pageResponse.body, /data-retention="daily"/u)
+  assert.match(pageResponse.body, /<option value="daily">日常记忆<\/option>/u)
   assert.match(pageResponse.body, /日常/u)
 
   const dataResponse = responseRecorder()
@@ -116,6 +117,69 @@ test('记忆观察面板显示日常保留层与自动晋升信息', async () =>
   assert.equal(data.stats.dailyMemories, 0)
   assert.equal(data.stats.promotedMemories, 1)
   assert.equal(data.memories[0].promotionState, 'promoted')
+})
+
+test('记忆观察面板分类卡片的数字、子类和点击结果不混入日常层', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'companion-console-layers-'))
+  const engine = await new MemoryEngine(root, 6).init()
+  await engine.ingest({ sessionId: 's1', speaker: 'user', text: '我住在上海市。', forcedKind: 'fact' })
+  const daily = await engine.ingest({
+    sessionId: 's1', speaker: 'user', text: '我正在测试宽带。', writeMode: 'auto',
+    historicalTimeBasis: 'snapshot-captured-at',
+  })
+  await engine.correct(daily.memory.id, { subcategory: 'daily-only' })
+  await engine.ingest({ sessionId: 's1', speaker: 'user', text: '我们一起练过钢琴。', forcedKind: 'relationship' })
+  await engine.ingest({ sessionId: 's1', speaker: 'user', text: '我们一起学着调音。', writeMode: 'auto' })
+  const routes = new Map()
+  registerMemoryConsoleRoutes({ ctx: contextFor(routes), engine })
+  const page = responseRecorder()
+  const data = responseRecorder()
+  await routes.get('/companion-memory/console').handler({ method: 'GET', url: '/' }, page)
+  await routes.get('/companion-memory/console/data').handler({ method: 'GET', url: '/' }, data)
+  const payload = JSON.parse(data.body)
+  assert.equal(payload.stats.categoryCounts.fact, 2)
+  assert.equal(payload.stats.durableCategoryCounts.fact, 1)
+  assert.equal(payload.stats.durableCategoryCounts.relationship, 1)
+  assert.equal(payload.stats.durableSubcategoryCounts['fact:daily-only'], undefined)
+
+  const ids = ['search', 'kind', 'retention', 'categories', 'stats', 'list', 'detail', 'count', 'status', 'events', 'refresh', 'auto']
+  const elements = Object.fromEntries(ids.map((id) => [id, { value: '', innerHTML: '', querySelectorAll: () => [] }]))
+  let buttons, rows
+  elements.categories.querySelectorAll = () => buttons = Array.from(
+    elements.categories.innerHTML.matchAll(/data-retention="([^"]+)" data-kind="([^"]*)"/gu),
+    ([, retention, kind]) => ({ dataset: { retention, kind } }),
+  )
+  elements.list.querySelectorAll = () => rows = Array.from(
+    elements.list.innerHTML.matchAll(/data-id="([^"]+)"/gu),
+    ([, id]) => ({ dataset: { id } }),
+  )
+  await runInNewContext(page.body.match(/<script>([\s\S]*)<\/script>/u)[1], {
+    URLSearchParams,
+    location: { search: '' },
+    document: { getElementById: (id) => elements[id] },
+    fetch: async () => ({ ok: true, json: async () => payload }),
+  })
+  assert.match(elements.categories.innerHTML, /事实<\/span><strong>1<\/strong>/u)
+  assert.match(elements.categories.innerHTML, /关系<\/span><strong>1<\/strong>/u)
+  assert.match(elements.categories.innerHTML, /日常<\/span><strong>2<\/strong>/u)
+  assert.doesNotMatch(elements.categories.innerHTML, /daily-only/u)
+  buttons.find((button) => button.dataset.retention === 'daily').onclick()
+  assert.equal(rows.length, 2)
+  assert.doesNotMatch(elements.list.innerHTML, /上海市|练过钢琴/u)
+  rows.find((row) => row.dataset.id === daily.memory.id).onclick()
+  assert.match(elements.detail.innerHTML, /测试宽带/u)
+  assert.match(elements.detail.innerHTML, /收录时间/u)
+  buttons.find((button) => button.dataset.kind === 'fact').onclick()
+  assert.equal(elements.retention.value, 'durable')
+  assert.equal(rows.length, 1)
+  assert.match(elements.list.innerHTML, /上海市/u)
+  assert.doesNotMatch(elements.detail.innerHTML, /测试宽带/u)
+  buttons.find((button) => button.dataset.kind === 'relationship').onclick()
+  assert.match(elements.list.innerHTML, /练过钢琴/u)
+  assert.doesNotMatch(elements.list.innerHTML, /学着调音/u)
+  elements.retention.value = ''
+  elements.retention.onchange()
+  assert.equal(rows.length, 2)
 })
 
 test('记忆观察面板未经 DSH 浏览器鉴权不读取记忆数据', async () => {
