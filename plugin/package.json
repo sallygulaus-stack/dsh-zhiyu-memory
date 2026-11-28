@@ -1,6 +1,6 @@
 {
   "name": "dsh-zhiyu-memory",
-  "version": "0.1.18",
+  "version": "0.1.19",
   "private": true,
   "type": "module",
   "description": "她记得住你说过的话，也记得清是哪一句。记忆会按类型自然变淡，记错了能改，不想提能删。",

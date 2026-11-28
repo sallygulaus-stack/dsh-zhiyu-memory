@@ -8,6 +8,7 @@ const HALF_LIFE_HOURS = {
   emotion: 24 * 14,
 }
 const DAILY_MEMORY_HALF_LIFE_HOURS = 48
+const MILESTONE_HALF_LIFE_HOURS = 24 * 365
 
 function now() {
   return new Date().toISOString()
@@ -15,6 +16,12 @@ function now() {
 
 function clamp(value, min = 0, max = 1) {
   return Math.min(max, Math.max(min, Number(value) || 0))
+}
+
+function halfLifeHours(memory) {
+  if (memory.retentionClass === 'daily') return DAILY_MEMORY_HALF_LIFE_HOURS
+  if (memory.kind === 'event' && memory.subcategory === 'milestone') return MILESTONE_HALF_LIFE_HOURS
+  return HALF_LIFE_HOURS[memory.kind] ?? HALF_LIFE_HOURS.fact
 }
 
 function freshness(memory, at) {
@@ -26,9 +33,7 @@ function freshness(memory, at) {
       || memory.recordedAt,
   ).getTime()
   const ageHours = Math.max(0, (new Date(at).getTime() - seen) / 3600000)
-  const halfLife = memory.retentionClass === 'daily'
-    ? DAILY_MEMORY_HALF_LIFE_HOURS
-    : HALF_LIFE_HOURS[memory.kind] ?? HALF_LIFE_HOURS.fact
+  const halfLife = halfLifeHours(memory)
   return clamp(Math.pow(0.5, ageHours / halfLife), 0.02, 1)
 }
 
@@ -44,9 +49,7 @@ function strength(memory, at) {
   const recalls = Number(memory.confirmedRecallCount ?? memory.recallCount ?? 0)
   const rehearsals = recalls + Number(memory.reinforcementCount || 0)
   const boost = Math.min(0.35, Math.log2(rehearsals + 1) * 0.08)
-  const halfLife = memory.retentionClass === 'daily'
-    ? DAILY_MEMORY_HALF_LIFE_HOURS
-    : HALF_LIFE_HOURS[memory.kind] ?? HALF_LIFE_HOURS.fact
+  const halfLife = halfLifeHours(memory)
   return clamp((base + boost) * Math.pow(0.5, ageHours / halfLife))
 }
 
@@ -114,7 +117,7 @@ function renderCategories(stats){
     applyFilters()
   })
 }
-function retentionLabel(m){if(m.promotionState==='promoted')return '已自动晋升';if(m.retentionClass==='daily')return '日常记忆';return '长期记忆'}
+function retentionLabel(m){if(m.retentionClass==='durable'&&m.promotionReason==='user-requested-milestone')return '长期记忆 · 纪念';if(m.promotionState==='promoted')return '已自动晋升';if(m.retentionClass==='daily')return '日常记忆';return '长期记忆'}
 function visible(){const q=$('search').value.trim().toLowerCase(),kind=$('kind').value,retention=$('retention').value;return (state.data?.memories??[]).filter(m=>(!kind||m.kind===kind)&&(!retention||(retention==='promoted'?m.promotionState==='promoted':m.retentionClass===retention))&&(!q||[m.summary,m.evidence,m.id,m.sourceSessionId,m.promotionReason].some(v=>String(v??'').toLowerCase().includes(q))))}
 function renderList(){const rows=visible();$('count').textContent=rows.length+' / '+(state.data?.memories?.length??0);$('list').innerHTML=rows.length?rows.map(m=>'<div class="row '+(m.id===state.selected?'active':'')+'" data-id="'+esc(m.id)+'"><div class="row-title">'+esc(m.summary||m.evidence||'(无摘要)')+'</div><div class="row-meta"><span class="tag">'+esc(m.kind||'未分类')+'</span><span class="tag">'+esc(m.subcategory||'other')+'</span><span class="tag '+(m.retentionClass==='daily'?'daily':m.promotionState==='promoted'?'promoted':'')+'">'+esc(retentionLabel(m))+'</span><span class="tag '+(m.status==='review'?'review':m.status==='deleted'?'deleted':'live')+'">'+esc(m.status||'active')+'</span><span>'+date(m.recordedAt)+'</span></div></div>').join(''):'<div class="empty">没有符合条件的记忆</div>';$('list').querySelectorAll('.row').forEach(el=>el.onclick=()=>{state.selected=el.dataset.id;renderList();renderDetail()})}
 function renderDetail(){
@@ -122,7 +125,12 @@ function renderDetail(){
   if(!m){$('detail').innerHTML='<div class="empty">点选左侧记忆查看来源</div>';return}
   const sources=(state.data?.turns??[]).filter(t=>(m.sourceTurnIds??[]).includes(t.id))
   const timeLabel=m.historicalTimeBasis==='snapshot-captured-at'?'收录时间':'发生时间'
-  $('detail').innerHTML='<h3>'+esc(m.summary||m.evidence)+'</h3><dl><dt>类型</dt><dd>'+esc(m.kind)+'</dd><dt>子类</dt><dd>'+esc(m.subcategory||'other')+'</dd><dt>保留层</dt><dd>'+esc(retentionLabel(m))+'</dd><dt>状态</dt><dd>'+esc(m.status||'active')+'</dd><dt>说话人</dt><dd>'+esc(m.speaker||m.subject||'—')+'</dd><dt>'+timeLabel+'</dt><dd>'+esc(date(m.occurredAt))+'</dd><dt>记录时间</dt><dd>'+esc(date(m.recordedAt))+'</dd><dt>最近回忆</dt><dd>'+esc(date(m.lastRecalledAt))+'</dd><dt>日常到期</dt><dd>'+esc(date(m.dailyExpiresAt))+'</dd><dt>晋升原因</dt><dd>'+esc(m.promotionReason||'—')+'</dd><dt>鲜活度</dt><dd>'+esc(Number(m.decay??0).toFixed(3))+'</dd><dt>当前强度</dt><dd>'+esc(Number(m.strength??0).toFixed(3))+'</dd><dt>来源会话</dt><dd>'+esc(m.sourceSessionId||'—')+'</dd><dt>来源回合</dt><dd>'+esc((m.sourceTurnIds??[]).join(', ')||'—')+'</dd></dl><div class="quote">'+esc(m.evidence||'没有保存原话证据')+'</div>'+(sources.length?'<div class="quote">'+sources.map(t=>esc('['+(t.speaker||'')+'] '+(t.text||''))).join('\\n')+'</div>':'')
+  const context=m.context??[]
+  const contextPanel='<h4>附近对话 · 上下文旁证，不是记忆事实</h4>'
+    +(context.length
+      ?context.map(t=>'<div class="quote">'+esc('['+(t.relation==='before'?'之前':'之后')+' · '+(t.speaker==='user'?'用户':'助手')+'] '+t.text)+'</div>').join('')
+      :'<div class="empty">没有可用的相邻回合；只显示这条记忆的原话。</div>')
+  $('detail').innerHTML='<h3>'+esc(m.summary||m.evidence)+'</h3><dl><dt>类型</dt><dd>'+esc(m.kind)+'</dd><dt>子类</dt><dd>'+esc(m.subcategory||'other')+'</dd><dt>保留层</dt><dd>'+esc(retentionLabel(m))+'</dd><dt>状态</dt><dd>'+esc(m.status||'active')+'</dd><dt>说话人</dt><dd>'+esc(m.speaker||m.subject||'—')+'</dd><dt>'+timeLabel+'</dt><dd>'+esc(date(m.occurredAt))+'</dd><dt>记录时间</dt><dd>'+esc(date(m.recordedAt))+'</dd><dt>最近回忆</dt><dd>'+esc(date(m.lastRecalledAt))+'</dd><dt>日常到期</dt><dd>'+esc(date(m.dailyExpiresAt))+'</dd><dt>晋升原因</dt><dd>'+esc(m.promotionReason||'—')+'</dd><dt>鲜活度</dt><dd>'+esc(Number(m.decay??0).toFixed(3))+'</dd><dt>当前强度</dt><dd>'+esc(Number(m.strength??0).toFixed(3))+'</dd><dt>来源会话</dt><dd>'+esc(m.sourceSessionId||'—')+'</dd><dt>来源回合</dt><dd>'+esc((m.sourceTurnIds??[]).join(', ')||'—')+'</dd></dl><h4>记忆原话</h4><div class="quote">'+esc(m.evidence||'没有保存原话证据')+'</div>'+(sources.length?'<div class="quote">'+sources.map(t=>esc('['+(t.speaker||'')+'] '+(t.text||''))).join('\\n')+'</div>':'')+contextPanel
 }
 function renderEvents(){const rows=(state.data?.events??[]).slice().reverse().slice(0,40);$('events').innerHTML=rows.length?rows.map(e=>'<div class="event"><b>'+esc(e.type||'event')+'</b><br><span class="label">'+esc(date(e.at||e.createdAt))+'</span></div>').join(''):'<div class="empty">暂无活动</div>'}
 function applyFilters(){
@@ -183,6 +191,7 @@ function registerMemoryConsoleRoutes({ ctx, engine }) {
         stats: await engine.stats(),
         memories: engine.list(true).map((memory) => ({
           ...memory,
+          context: engine.contextForMemory(memory),
           decay: freshness(memory, generatedAt),
           strength: strength(memory, generatedAt),
         })),

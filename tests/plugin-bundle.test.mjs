@@ -44,6 +44,8 @@ test('DSH bundle 使用分类鲜活度并保留时间字段', async () => {
   const oldMemory = { ...memory, lastSupportedAt: '2026-10-22T00:00:00.000Z' }
   assert.ok(freshness({ ...oldMemory, kind: 'relationship' }, '2026-11-22T00:00:00.000Z')
     > freshness({ ...oldMemory, kind: 'emotion' }, '2026-11-22T00:00:00.000Z'))
+  assert.ok(freshness({ ...oldMemory, kind: 'event', subcategory: 'milestone' }, '2026-11-22T00:00:00.000Z')
+    > freshness({ ...oldMemory, kind: 'event', subcategory: 'other' }, '2026-11-22T00:00:00.000Z'))
   assert.ok(strength(memory, '2026-11-22T00:00:00.000Z') > 0)
 })
 
@@ -132,6 +134,52 @@ test('DSH bundle 自动注入会带证据和发生时间，不依赖模型主动
   assert.deepEqual(auto.memoryIds, [saved.memory.id])
   assert.equal(auto.injected, true)
   assert.equal((await engine.stats()).autoInjectHitCount, 1)
+})
+
+test('记忆上下文只取来源会话邻近回合，排除原话与其他会话并受长度和数量限制', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'companion-memory-context-'))
+  const engine = await new MemoryEngine(root, 6).init()
+  for (let index = 0; index < 5; index += 1) {
+    await engine.ingest({
+      sessionId: 'source-session',
+      speaker: index % 2 ? 'assistant' : 'user',
+      text: `之前的上下文第${index}条。`,
+      sourceKey: `before-${index}`,
+    })
+  }
+  const saved = await engine.ingest({
+    sessionId: 'source-session',
+    speaker: 'user',
+    text: '2026年11月25日我们第一次一起看了神舟发射。',
+    sourceKey: 'milestone-source',
+  })
+  await engine.ingest({
+    sessionId: 'other-session',
+    speaker: 'user',
+    text: '不得串进来的另一会话内容。',
+    sourceKey: 'other-session-decoy',
+  })
+  for (let index = 0; index < 5; index += 1) {
+    await engine.ingest({
+      sessionId: 'source-session',
+      speaker: index % 2 ? 'assistant' : 'user',
+      text: `之后的上下文第${index}条。`,
+      sourceKey: `after-${index}`,
+    })
+  }
+
+  const memory = engine.memories.get(saved.memory.id)
+  const context = engine.contextForMemory(memory)
+  assert.equal(context.length, 4)
+  assert.deepEqual(context.map((turn) => turn.relation), ['before', 'before', 'after', 'after'])
+  assert.ok(context.every((turn) => turn.text !== memory.evidence))
+  assert.ok(context.every((turn) => turn.text.length <= 240))
+  assert.ok(context.every((turn) => !turn.text.includes('另一会话')))
+  assert.ok(context.some((turn) => turn.text.includes('之前的上下文第3条')))
+  assert.ok(context.some((turn) => turn.text.includes('之后的上下文第0条')))
+  const limited = engine.contextForMemory(memory, { radius: 4, maxTurns: 2, maxChars: 8 })
+  assert.equal(limited.length, 2)
+  assert.ok(limited.every((turn) => turn.text.length <= 8))
 })
 
 test('DSH bundle 只在具体词组匹配时召回能核实聊天原话的木偶迁移条目', async () => {
@@ -242,6 +290,7 @@ test('DSH bundle 会用近期对话展开“那个/这种”指代后再自动�
   })
   const context = await engine.context('s1', '今天还是那个搭配。')
   assert.match(context, /黄瓜、豆角和萝卜条/u)
+  assert.doesNotMatch(context, /同会话上下文旁证/u)
   const recall = engine.events.findLast((event) => event.type === 'recall')
   assert.equal(recall.mode, 'auto')
   assert.equal(recall.query, '今天还是那个搭配。')
@@ -688,7 +737,10 @@ test('DSH bundle consumes only live owner QQ waits, deduplicates, and recalls in
   await preStep(nextSession, '昨晚我们一起看了神舟发射吗？')
   assert.match(systemContext.text({ scope: { session: nextSession } }), /昨晚我们一起看了神舟发射/u)
   const { hits } = await tool.execute({ action: 'recall', query: '昨晚我们一起看了神舟发射' }, { agent: { session: nextSession } })
-  assert.ok(hits.some((hit) => hit.memory.evidence === second.text))
+  const shenzhou = hits.find((hit) => hit.memory.evidence === second.text)
+  assert.ok(shenzhou)
+  assert.ok(shenzhou.memory.context.some((turn) => turn.text === first.text))
+  assert.notEqual(shenzhou.memory.context[0].text, shenzhou.memory.evidence)
   assert.deepEqual(JSON.parse(JSON.stringify(hits)), hits)
   dispose()
 

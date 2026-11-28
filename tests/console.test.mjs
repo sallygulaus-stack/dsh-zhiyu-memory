@@ -55,6 +55,12 @@ test('记忆观察面板注册网页和只读数据路由', async () => {
     sourceKey: 'console-turn-1',
     occurredAt: '2026-11-22T10:00:00.000Z',
   })
+  await engine.ingest({
+    sessionId: 'session-1',
+    speaker: 'assistant',
+    text: '<script>上下文只是旁证</script>',
+    sourceKey: 'console-context-turn',
+  })
   const routes = new Map()
   const dispose = registerMemoryConsoleRoutes({ ctx: contextFor(routes), engine })
   assert.ok(routes.has('/companion-memory/console'))
@@ -77,6 +83,7 @@ test('记忆观察面板注册网页和只读数据路由', async () => {
   const data = JSON.parse(dataResponse.body)
   assert.equal(data.memories.length, 1)
   assert.equal(data.memories[0].evidence, '我喜欢先看结论。')
+  assert.equal(data.memories[0].context[0].text, '<script>上下文只是旁证</script>')
   assert.equal(data.memories[0].subcategory, 'response-format')
   assert.equal(data.memories[0].occurredAt, '2026-11-22T10:00:00.000Z')
   assert.equal(data.stats.categoryCounts.preference, 1)
@@ -129,7 +136,12 @@ test('记忆观察面板分类卡片的数字、子类和点击结果不混入�
   })
   await engine.correct(daily.memory.id, { subcategory: 'daily-only' })
   await engine.ingest({ sessionId: 's1', speaker: 'user', text: '我们一起练过钢琴。', forcedKind: 'relationship' })
-  await engine.ingest({ sessionId: 's1', speaker: 'user', text: '我们一起学着调音。', writeMode: 'auto' })
+  await engine.ingest({
+    sessionId: 's1',
+    speaker: 'user',
+    text: '我们一起学着调音。<script>附近上下文</script>',
+    writeMode: 'auto',
+  })
   const routes = new Map()
   registerMemoryConsoleRoutes({ ctx: contextFor(routes), engine })
   const page = responseRecorder()
@@ -141,6 +153,7 @@ test('记忆观察面板分类卡片的数字、子类和点击结果不混入�
   assert.equal(payload.stats.durableCategoryCounts.fact, 1)
   assert.equal(payload.stats.durableCategoryCounts.relationship, 1)
   assert.equal(payload.stats.durableSubcategoryCounts['fact:daily-only'], undefined)
+  assert.match(page.body, /附近对话 · 上下文旁证/u)
 
   const ids = ['search', 'kind', 'retention', 'categories', 'stats', 'list', 'detail', 'count', 'status', 'events', 'refresh', 'auto']
   const elements = Object.fromEntries(ids.map((id) => [id, { value: '', innerHTML: '', querySelectorAll: () => [] }]))
@@ -168,6 +181,10 @@ test('记忆观察面板分类卡片的数字、子类和点击结果不混入�
   assert.doesNotMatch(elements.list.innerHTML, /上海市|练过钢琴/u)
   rows.find((row) => row.dataset.id === daily.memory.id).onclick()
   assert.match(elements.detail.innerHTML, /测试宽带/u)
+  assert.match(elements.detail.innerHTML, /上下文旁证，不是记忆事实/u)
+  assert.match(elements.detail.innerHTML, /之前 · 用户/u)
+  assert.match(elements.detail.innerHTML, /&lt;script&gt;附近上下文&lt;\/script&gt;/u)
+  assert.doesNotMatch(elements.detail.innerHTML, /<script>附近上下文<\/script>/u)
   assert.match(elements.detail.innerHTML, /收录时间/u)
   buttons.find((button) => button.dataset.kind === 'fact').onclick()
   assert.equal(elements.retention.value, 'durable')

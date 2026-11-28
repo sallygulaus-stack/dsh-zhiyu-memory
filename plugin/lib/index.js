@@ -18,6 +18,7 @@ const HALF_LIFE_HOURS = {
   event: 24 * 21,
   emotion: 24 * 14,
 }
+const MILESTONE_HALF_LIFE_HOURS = 24 * 365
 const DAILY_MEMORY_HALF_LIFE_HOURS = 48
 const DAILY_MEMORY_RETENTION_DAYS = 7
 const DEFAULT_DAILY_WRITE_BUDGET = 24
@@ -532,6 +533,12 @@ function shouldPromoteDaily(memory, candidate) {
   return sessions.size >= 2 || (dates.size >= 2 && Number(memory.reinforcementCount || 0) >= 2)
 }
 
+function halfLifeHours(memory) {
+  if (memory.retentionClass === 'daily') return DAILY_MEMORY_HALF_LIFE_HOURS
+  if (memory.kind === 'event' && memory.subcategory === 'milestone') return MILESTONE_HALF_LIFE_HOURS
+  return HALF_LIFE_HOURS[memory.kind] ?? HALF_LIFE_HOURS.fact
+}
+
 function strength(memory, at) {
   const seen = new Date(memory.lastReinforcedAt || memory.lastSupportedAt || memory.lastSeenAt || memory.occurredAt).getTime()
   const ageHours = Math.max(0, (new Date(at).getTime() - seen) / 3600000)
@@ -539,18 +546,14 @@ function strength(memory, at) {
   const confirmedRecalls = Number(memory.confirmedRecallCount ?? memory.recallCount ?? 0)
   const rehearsals = confirmedRecalls + Number(memory.reinforcementCount || 0)
   const boost = Math.min(0.35, Math.log2(rehearsals + 1) * 0.08)
-  const halfLife = memory.retentionClass === 'daily'
-    ? DAILY_MEMORY_HALF_LIFE_HOURS
-    : HALF_LIFE_HOURS[memory.kind] ?? HALF_LIFE_HOURS.fact
+  const halfLife = halfLifeHours(memory)
   return clamp((base + boost) * Math.pow(0.5, ageHours / halfLife))
 }
 
 function freshness(memory, at) {
   const seen = new Date(memory.lastReinforcedAt || memory.lastSupportedAt || memory.lastSeenAt || memory.occurredAt || memory.recordedAt).getTime()
   const ageHours = Math.max(0, (new Date(at).getTime() - seen) / 3600000)
-  const halfLife = memory.retentionClass === 'daily'
-    ? DAILY_MEMORY_HALF_LIFE_HOURS
-    : HALF_LIFE_HOURS[memory.kind] ?? HALF_LIFE_HOURS.fact
+  const halfLife = halfLifeHours(memory)
   return clamp(Math.pow(0.5, ageHours / halfLife), 0.02, 1)
 }
 
@@ -1643,7 +1646,49 @@ class MemoryEngine {
     return {
       memory,
       sources: this.turns.filter((turn) => memory.sourceTurnIds.includes(turn.id)),
+      context: this.contextForMemory(memory),
     }
+  }
+
+  contextForMemory(memory, { radius = 2, maxTurns = 8, maxChars = 240 } = {}) {
+    if (!memory?.sourceSessionId || !Array.isArray(memory.sourceTurnIds) || !memory.sourceTurnIds.length) return []
+    const sourceIds = new Set(memory.sourceTurnIds)
+    const turns = this.turns
+      .map((turn, index) => ({ turn, index }))
+      .filter(({ turn }) => turn.sessionId === memory.sourceSessionId
+        && ['user', 'assistant'].includes(turn.speaker)
+        && !this.purgedTurnIds.has(turn.id))
+    const sourceIndexes = turns
+      .map(({ turn }, index) => sourceIds.has(turn.id) ? index : -1)
+      .filter((index) => index >= 0)
+    if (!sourceIndexes.length) return []
+    const nearby = new Map()
+    for (const sourceIndex of sourceIndexes) {
+      for (let offset = -radius; offset <= radius; offset += 1) {
+        if (!offset) continue
+        const entry = turns[sourceIndex + offset]
+        if (!entry || sourceIds.has(entry.turn.id)) continue
+        const distance = Math.abs(offset)
+        const previous = nearby.get(entry.turn.id)
+        if (!previous || distance < previous.distance) {
+          nearby.set(entry.turn.id, {
+            turn: entry.turn,
+            index: entry.index,
+            distance,
+            relation: offset < 0 ? 'before' : 'after',
+          })
+        }
+      }
+    }
+    return [...nearby.values()]
+      .sort((a, b) => a.index - b.index)
+      .slice(0, maxTurns)
+      .map(({ turn, relation }) => ({
+        relation,
+        speaker: turn.speaker,
+        text: String(turn.text || '').slice(0, maxChars),
+        occurredAt: turn.occurredAt ?? null,
+      }))
   }
 
   async stats() {
@@ -1712,18 +1757,21 @@ function asText(value) {
 const RECALL_MEMORY_FIELDS = [
   'id', 'kind', 'subcategory', 'recordType', 'subjectType', 'summary', 'evidence',
   'sourceTurnIds', 'sourceSessionId', 'occurredAt', 'recordedAt', 'lastRecalledAt',
-  'factKey', 'claimType', 'epistemicStatus', 'status', 'writePriority',
+  'factKey', 'claimType', 'epistemicStatus', 'status', 'writePriority', 'context',
 ]
 
-function compactMemory(memory) {
+function compactMemory(memory, context = []) {
   // Older rows may lack fields; keep the tool output lossless without changing the stored row.
-  return Object.fromEntries(RECALL_MEMORY_FIELDS.map((field) => [field, memory[field] ?? null]))
+  return Object.fromEntries(RECALL_MEMORY_FIELDS.map((field) => [
+    field,
+    field === 'context' ? context : memory[field] ?? null,
+  ]))
 }
 
-function compactRecallHits(hits) {
+function compactRecallHits(hits, contextForMemory = () => []) {
   return hits.map(({ memory, ...hit }) => ({
     ...hit,
-    memory: compactMemory(memory),
+    memory: compactMemory(memory, contextForMemory(memory)),
   }))
 }
 
@@ -1838,7 +1886,7 @@ async function apply(ctx, config = {}) {
   ctx.systemPrompt.section({
     name: 'companion-memory-guidance',
     order: (ctx.systemPrompt.getSectionOrder('TOOLS_SDK') ?? 5000) + 10,
-    text: '伴生记忆已启用。插件会在每轮自动检索并注入相关记忆；普通连续性不需要重复调用 recall。只把自动注入或记忆工具返回的内容当作有来源参考；需要完整原话、确认、纠正或删除时再使用记忆工具。工具可用性以本回合工具清单和本回合调用结果为准；历史回合出现过的拒绝或白名单错误，不代表工具当前仍不可用。如果 companion_memory 在本回合工具清单中，遇到用户明确要求记住、纠正事实或补充重要细节时，应直接尝试调用；只有本次调用返回失败，才能说这次没有写入。只有本次工具调用返回成功写入回执（例如 stored=true 且带有记忆 ID），才能说内容已写入长期记忆；仅在聊天中回应或复述不等于持久化。如果用户问以前是否提过某事，而没有相符的记忆或原话，请直接说目前无法确认，不要把推测当成回忆。遇到「还是那样」「上次那套」等指代，能从当前对话或相关记忆接上就自然接话；如果缺少具体线索且没有匹配的注入，先简短问用户指哪一件，不调用 recall 来盲找，不把相近偏好当成发生过的事。用户明确纠正、删除或要求忘记时，以最新要求为准。不要因为一次临时情绪或寒暄就扩大长期记忆。',
+    text: '伴生记忆已启用。插件会在每轮自动检索并注入相关记忆；普通连续性不需要重复调用 recall。记忆工具返回的 context 是来源同会话的相邻对话，只作理解背景的旁证，不是记忆事实；evidence 才是该条记忆保存的原话。只把自动注入或记忆工具返回的内容当作有来源参考；需要完整原话、确认、纠正或删除时再使用记忆工具。工具可用性以本回合工具清单和本回合调用结果为准；历史回合出现过的拒绝或白名单错误，不代表工具当前仍不可用。如果 companion_memory 在本回合工具清单中，遇到用户明确要求记住、纠正事实或补充重要细节时，应直接尝试调用；只有本次调用返回失败，才能说这次没有写入。只有本次工具调用返回成功写入回执（例如 stored=true 且带有记忆 ID），才能说内容已写入长期记忆；仅在聊天中回应或复述不等于持久化。如果用户问以前是否提过某事，而没有相符的记忆或原话，请直接说目前无法确认，不要把推测当成回忆。遇到「还是那样」「上次那套」等指代，能从当前对话或相关记忆接上就自然接话；如果缺少具体线索且没有匹配的注入，先简短问用户指哪一件，不调用 recall 来盲找，不把相近偏好当成发生过的事。用户明确纠正、删除或要求忘记时，以最新要求为准。不要因为一次临时情绪或寒暄就扩大长期记忆。',
   })
   ctx.systemPrompt.context({
     name: 'companion-memory-recall',
@@ -1852,7 +1900,7 @@ async function apply(ctx, config = {}) {
 
   ctx.tools.register({
     name: 'companion_memory',
-    description: 'Manage the lightweight companion memory. Use remember for an explicit durable fact or correction, recall for candidate retrieval, confirm_recall only after an explicit confirmation, list/explain for audit, correct/forget/restore for user control, and consolidate for maintenance. Deletion levels are separate: soft-delete stops recall, recall-block stops recall but keeps the claim, export-exclude hides it from new archives, and purge removes the claim only — original turns, existing archives and backups are still kept, so purge is NOT a full erasure.',
+    description: 'Manage the lightweight companion memory. Use remember for an explicit durable fact or correction, recall for candidate retrieval, confirm_recall only after an explicit confirmation, list/explain for audit, correct/forget/restore for user control, and consolidate for maintenance. A recall hit includes evidence (the saved memory quote) and context (bounded adjacent turns from that same source session, provided only as non-factual background). Deletion levels are separate: soft-delete stops recall, recall-block stops recall but keeps the claim, export-exclude hides it from new archives, and purge removes the claim only — original turns, existing archives and backups are still kept, so purge is NOT a full erasure.',
     parameters: {
       action: { type: 'string', required: true, enum: ['remember', 'recall', 'confirm_recall', 'list', 'explain', 'correct', 'forget', 'restore', 'stats', 'consolidate'] },
       text: { type: 'string' },
@@ -1882,7 +1930,12 @@ async function apply(ctx, config = {}) {
         writeMode: 'manual',
       })
       if (args.action === 'recall') {
-        return { hits: compactRecallHits(await engine.recall(asText(args.query || args.text), sessionId)) }
+        return {
+          hits: compactRecallHits(
+            await engine.recall(asText(args.query || args.text), sessionId),
+            (memory) => engine.contextForMemory(memory),
+          ),
+        }
       }
       if (args.action === 'confirm_recall') {
         const memoryIds = Array.isArray(args.memoryIds)
